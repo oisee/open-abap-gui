@@ -17,6 +17,10 @@ CLASS cl_gui_control DEFINITION PUBLIC INHERITING FROM cl_gui_object.
              fields       TYPE ty_fields,
            END OF ty_sapevent.
 
+* The hidden field of every rewritten form that names the control the
+* document belongs to, so that the event can be raised on that one.
+    CONSTANTS c_sapevent_control TYPE string VALUE 'gg_control'.
+
     DATA parent TYPE REF TO cl_gui_container.
     DATA control_id TYPE string.
     DATA mv_width TYPE i.
@@ -79,7 +83,10 @@ CLASS cl_gui_control DEFINITION PUBLIC INHERITING FROM cl_gui_object.
 
     CLASS-METHODS set_focus
       IMPORTING
-        control TYPE REF TO cl_gui_control.
+        control TYPE REF TO cl_gui_control
+      EXCEPTIONS
+        cntl_error
+        cntl_system_error.
 
     METHODS get_width
       EXPORTING
@@ -109,7 +116,11 @@ CLASS cl_gui_control DEFINITION PUBLIC INHERITING FROM cl_gui_object.
 
     METHODS set_registered_events
       IMPORTING
-        events TYPE any.
+        events TYPE any
+      EXCEPTIONS
+        cntl_error
+        cntl_system_error
+        illegal_event_combination.
 
     CLASS-METHODS get_focus
       EXPORTING
@@ -290,6 +301,31 @@ CLASS cl_gui_control DEFINITION PUBLIC INHERITING FROM cl_gui_object.
       IMPORTING
         document      TYPE string
         sapevent      TYPE ty_sapevent
+        control_id    TYPE string
+      RETURNING
+        VALUE(result) TYPE string.
+    CLASS-METHODS rewrite_sapevent_forms
+      IMPORTING
+        document      TYPE string
+        sapevent      TYPE ty_sapevent
+        control_id    TYPE string
+      RETURNING
+        VALUE(result) TYPE string.
+    CLASS-METHODS sapevent_hidden_fields
+      IMPORTING
+        sapevent      TYPE ty_sapevent
+        control_id    TYPE string
+      RETURNING
+        VALUE(result) TYPE string.
+    CLASS-METHODS sapevent_form_action
+      IMPORTING
+        sapevent      TYPE ty_sapevent
+        action        TYPE string
+      RETURNING
+        VALUE(result) TYPE string.
+    CLASS-METHODS url_encode
+      IMPORTING
+        text          TYPE string
       RETURNING
         VALUE(result) TYPE string.
     CLASS-METHODS safe_url
@@ -799,8 +835,12 @@ CLASS cl_gui_control IMPLEMENTATION.
 * anchors become forms that submit to it. Submitting a form and, on a real
 * click, replacing the top page are the only two things this needs; scripts
 * stay blocked and the frame keeps its opaque origin.
-            lv_srcdoc = rewrite_sapevent( document = lv_srcdoc
-                                          sapevent = is_sapevent ).
+            lv_srcdoc = rewrite_sapevent( document   = lv_srcdoc
+                                          sapevent   = is_sapevent
+                                          control_id = is_snapshot-control_id ).
+            lv_srcdoc = rewrite_sapevent_forms( document   = lv_srcdoc
+                                                sapevent   = is_sapevent
+                                                control_id = is_snapshot-control_id ).
             lv_sandbox = `allow-forms allow-top-navigation-by-user-activation`.
           ENDIF.
           lv_iframe_source = |srcdoc="{ escape( lv_srcdoc ) }"|.
@@ -1445,7 +1485,6 @@ CLASS cl_gui_control IMPLEMENTATION.
     DATA lv_action     TYPE string.
     DATA lv_attributes TYPE string.
     DATA lv_form       TYPE string.
-    DATA ls_field      TYPE ty_field.
 
     lv_rest = document.
     WHILE lv_rest IS NOT INITIAL.
@@ -1504,11 +1543,9 @@ CLASS cl_gui_control IMPLEMENTATION.
                                  len = lv_tag_end - 2 ).
       REPLACE FIRST OCCURRENCE OF |{ lc_marker }{ lv_action }"| IN lv_attributes WITH ``.
 
-      lv_form = |<form class="gg-sapevent" method="post" action="{ escape( sapevent-url ) }" target="_top">|.
-      LOOP AT sapevent-fields INTO ls_field.
-        lv_form = lv_form && |<input type="hidden" name="{ escape( ls_field-name ) }"| &&
-          | value="{ escape( ls_field-value ) }">|.
-      ENDLOOP.
+      lv_form = |<form class="gg-sapevent" method="post" action="{ escape( sapevent-url ) }" target="_top">| &&
+        sapevent_hidden_fields( sapevent   = sapevent
+                                control_id = control_id ).
 * The action is taken out of an attribute of the document and put back into
 * one, so it is already escaped at exactly the level it is needed at.
       lv_form = lv_form && |<button type="submit" name="{ escape( sapevent-action_field ) }"| &&
@@ -1530,6 +1567,165 @@ CLASS cl_gui_control IMPLEMENTATION.
                            off = lv_close + 4 ).
     ENDWHILE.
     result = result && lv_rest.
+  ENDMETHOD.
+
+  METHOD rewrite_sapevent_forms.
+* A document can post a sapevent itself: <form action="sapevent:ACTION"> or a
+* submit button with formaction="sapevent:ACTION" inside a form. Such a form
+* is pointed at the transport instead, with the action carried in the query
+* string of its url, so that the body stays exactly the document's own fields;
+* and the transport's hidden fields are put inside it. Forms that post
+* somewhere else are left alone, hidden fields and all.
+    CONSTANTS lc_action TYPE string VALUE 'action="sapevent:'.
+    CONSTANTS lc_formaction TYPE string VALUE 'formaction="sapevent:'.
+    DATA lv_rest    TYPE string.
+    DATA lv_offset  TYPE i.
+    DATA lv_tag_end TYPE i.
+    DATA lv_close   TYPE i.
+    DATA lv_quote   TYPE i.
+    DATA lv_head    TYPE string.
+    DATA lv_tag     TYPE string.
+    DATA lv_body    TYPE string.
+    DATA lv_action  TYPE string.
+    DATA lv_marker  TYPE string.
+
+    lv_rest = document.
+    WHILE lv_rest IS NOT INITIAL.
+      FIND FIRST OCCURRENCE OF '<form' IN lv_rest MATCH OFFSET lv_offset.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      result = result && substring( val = lv_rest
+                                    len = lv_offset ).
+      lv_rest = substring( val = lv_rest
+                           off = lv_offset ).
+      IF strlen( lv_rest ) < 6.
+        EXIT.
+      ENDIF.
+      lv_head = substring( val = lv_rest
+                           len = 6 ).
+      IF lv_head <> `<form ` AND lv_head <> `<form>`.
+        result = result && substring( val = lv_rest
+                                      len = 5 ).
+        lv_rest = substring( val = lv_rest
+                             off = 5 ).
+        CONTINUE.
+      ENDIF.
+      FIND FIRST OCCURRENCE OF '>' IN lv_rest MATCH OFFSET lv_tag_end.
+      IF sy-subrc <> 0.
+        EXIT.
+      ENDIF.
+      lv_tag = substring( val = lv_rest
+                          len = lv_tag_end + 1 ).
+      lv_rest = substring( val = lv_rest
+                           off = lv_tag_end + 1 ).
+      FIND FIRST OCCURRENCE OF '</form>' IN lv_rest MATCH OFFSET lv_close.
+      IF sy-subrc <> 0.
+        lv_body = lv_rest.
+        CLEAR lv_rest.
+      ELSE.
+        lv_body = substring( val = lv_rest
+                             len = lv_close ).
+        lv_rest = substring( val = lv_rest
+                             off = lv_close ).
+      ENDIF.
+
+* Not a sapevent form: kept as it is, our own rewritten anchors included.
+      IF lv_tag NS lc_action AND lv_body NS lc_formaction.
+        result = result && lv_tag && lv_body.
+        CONTINUE.
+      ENDIF.
+
+      FIND FIRST OCCURRENCE OF lc_action IN lv_tag MATCH OFFSET lv_offset.
+      IF sy-subrc = 0.
+        lv_action = substring( val = lv_tag
+                               off = lv_offset + strlen( lc_action ) ).
+        FIND FIRST OCCURRENCE OF '"' IN lv_action MATCH OFFSET lv_quote.
+        IF sy-subrc = 0.
+          lv_action = substring( val = lv_action
+                                 len = lv_quote ).
+          lv_marker = |{ lc_action }{ lv_action }"|.
+          REPLACE FIRST OCCURRENCE OF lv_marker IN lv_tag
+            WITH |action="{ sapevent_form_action( sapevent = sapevent
+                                                  action   = lv_action ) }"|.
+        ENDIF.
+      ENDIF.
+      IF lv_tag NS ' target='.
+        lv_tag = substring( val = lv_tag
+                            len = strlen( lv_tag ) - 1 ) && | target="_top">|.
+      ENDIF.
+
+      WHILE lv_body CS lc_formaction.
+        FIND FIRST OCCURRENCE OF lc_formaction IN lv_body MATCH OFFSET lv_offset.
+        lv_action = substring( val = lv_body
+                               off = lv_offset + strlen( lc_formaction ) ).
+        FIND FIRST OCCURRENCE OF '"' IN lv_action MATCH OFFSET lv_quote.
+        IF sy-subrc <> 0.
+          EXIT.
+        ENDIF.
+        lv_action = substring( val = lv_action
+                               len = lv_quote ).
+        lv_marker = |{ lc_formaction }{ lv_action }"|.
+        REPLACE FIRST OCCURRENCE OF lv_marker IN lv_body
+          WITH |formaction="{ sapevent_form_action( sapevent = sapevent
+                                                    action   = lv_action ) }"|.
+      ENDWHILE.
+
+      result = result && lv_tag &&
+        sapevent_hidden_fields( sapevent   = sapevent
+                                control_id = control_id ) && lv_body.
+    ENDWHILE.
+    result = result && lv_rest.
+  ENDMETHOD.
+
+  METHOD sapevent_hidden_fields.
+    DATA ls_field TYPE ty_field.
+
+    LOOP AT sapevent-fields INTO ls_field.
+      result = result && |<input type="hidden" name="{ escape( ls_field-name ) }"| &&
+        | value="{ escape( ls_field-value ) }">|.
+    ENDLOOP.
+    result = result && |<input type="hidden" name="{ c_sapevent_control }" value="{ escape( control_id ) }">|.
+  ENDMETHOD.
+
+  METHOD sapevent_form_action.
+* The action is taken out of an attribute of the document, so its entities
+* are undone before it is encoded for the query string of the url.
+    DATA lv_action TYPE string.
+
+    lv_action = action.
+    REPLACE ALL OCCURRENCES OF '&lt;' IN lv_action WITH '<'.
+    REPLACE ALL OCCURRENCES OF '&gt;' IN lv_action WITH '>'.
+    REPLACE ALL OCCURRENCES OF '&quot;' IN lv_action WITH '"'.
+    REPLACE ALL OCCURRENCES OF '&#39;' IN lv_action WITH ''''.
+    REPLACE ALL OCCURRENCES OF '&amp;' IN lv_action WITH '&'.
+    result = escape( sapevent-url ) && `?` && url_encode( sapevent-action_field ) &&
+      `=` && url_encode( lv_action ).
+  ENDMETHOD.
+
+  METHOD url_encode.
+* Percent-encodes everything outside the unreserved set, byte by byte in UTF-8.
+    DATA lv_index TYPE i.
+    DATA lv_char  TYPE string.
+    DATA lv_bytes TYPE xstring.
+    DATA lv_byte  TYPE x LENGTH 1.
+    DATA lv_hex   TYPE string.
+
+    DO strlen( text ) TIMES.
+      lv_index = sy-index - 1.
+      lv_char = text+lv_index(1).
+      IF to_upper( lv_char ) CA sy-abcde OR lv_char CA '0123456789-_.~'.
+        result = result && lv_char.
+      ELSE.
+        lv_bytes = cl_abap_codepage=>convert_to( lv_char ).
+        DO xstrlen( lv_bytes ) TIMES.
+          lv_index = sy-index - 1.
+          lv_byte = lv_bytes+lv_index(1).
+          lv_hex = lv_byte.
+          result = result && `%` && lv_hex.
+        ENDDO.
+      ENDIF.
+    ENDDO.
   ENDMETHOD.
 
   METHOD escape.
