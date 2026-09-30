@@ -284,6 +284,28 @@ test("reports unsupported WRITE additions individually", async () => {
   assert.match(result.classSource, /TODO GGCONV-E501: unsupported WRITE formatting/);
 });
 
+test("preserves all seven DATASET statements in the generated method", async () => {
+  const statements = [
+    "OPEN DATASET f FOR INPUT IN TEXT MODE ENCODING UTF-8.",
+    "READ DATASET f INTO v.",
+    "TRANSFER v TO f.",
+    "CLOSE DATASET f.",
+    "DELETE DATASET f.",
+    "GET DATASET f POSITION p.",
+    "SET DATASET f POSITION p.",
+  ];
+  const source = ["REPORT zdataset.", "DATA f TYPE string.", "DATA v TYPE string.", "DATA p TYPE i.", "START-OF-SELECTION.", ...statements].join("\n");
+  const result = await convertProgram({source, filename: "zdataset.prog.abap"});
+  assert.equal(result.supported, true, JSON.stringify(result.diagnostics));
+  for (const statement of statements) assert.ok(result.classSource.includes(statement), statement);
+});
+
+test("unrelated unsupported statements remain refused", async () => {
+  const result = await convertProgram({source: "REPORT zunsupported.\nCALL TRANSACTION 'SE38' USING bdcdata.\n", filename: "zunsupported.prog.abap"});
+  assert.equal(result.supported, false);
+  assert.ok(result.diagnostics.some((item) => item.code === "GGCONV-E516"));
+});
+
 test("lowers classic named WRITE hotspot and color formatting", async () => {
   const result = await convertProgram({
     source: "REPORT zwrite_classic.\nSTART-OF-SELECTION.\nWRITE 15 'Program' HOTSPOT COLOR COL_KEY.\n",
