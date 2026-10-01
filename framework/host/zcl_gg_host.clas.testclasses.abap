@@ -48,7 +48,7 @@ CLASS lcl_report IMPLEMENTATION.
     lo_writer = writer( io_session ).
 
     CASE mv_mode.
-      WHEN 'HELLO'.
+      WHEN 'HELLO' OR 'WARN'.
         lo_writer->write_field( VALUE #( text = 'hello world' ) ).
 
       WHEN 'ESCAPE'.
@@ -154,6 +154,15 @@ CLASS lcl_report IMPLEMENTATION.
           text       = 'Carrier'
           data_type  = VALUE #( typ = 'C' length = 3 )
           obligatory = abap_true ) ).
+      WHEN 'ON_FIELD' OR 'WARN'.
+        io_builder->add_parameter( VALUE #(
+          name      = 'P_A'
+          text      = 'A'
+          data_type = VALUE #( typ = 'C' length = 3 ) ) ).
+        io_builder->add_parameter( VALUE #(
+          name      = 'P_B'
+          text      = 'B'
+          data_type = VALUE #( typ = 'C' length = 3 ) ) ).
       WHEN OTHERS.
         RETURN.
     ENDCASE.
@@ -188,6 +197,11 @@ CLASS lcl_report IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_report_v1~at_selection_screen.
+    IF mv_mode = 'WARN'.
+      io_session->message( VALUE #(
+        type = zif_gg_session_types_v1=>message_type_warning
+        text = 'Are you sure' ) ).
+    ENDIF.
     IF mv_mode = 'OUTPUT'.
       io_session->message( VALUE #(
         type = zif_gg_session_types_v1=>message_type_error
@@ -196,7 +210,11 @@ CLASS lcl_report IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_report_v1~at_selection_screen_on_field.
-    RETURN.
+    IF mv_mode = 'ON_FIELD' AND iv_name = 'P_B'.
+      io_session->message( VALUE #(
+        type = zif_gg_session_types_v1=>message_type_error
+        text = 'B is wrong' ) ).
+    ENDIF.
   ENDMETHOD.
 
   METHOD zif_gg_report_v1~at_selection_screen_on_end_of.
@@ -278,6 +296,9 @@ CLASS ltcl_host DEFINITION FINAL FOR TESTING DURATION SHORT RISK LEVEL HARMLESS.
     METHODS selection_sibling_blocks FOR TESTING.
     METHODS html_gui_fixture FOR TESTING.
     METHODS replaces_a_host_session FOR TESTING.
+    METHODS selection_error_on_field FOR TESTING.
+    METHODS selection_warning_confirmed FOR TESTING.
+    METHODS selection_error_required FOR TESTING.
 
 ENDCLASS.
 
@@ -343,6 +364,53 @@ CLASS ltcl_host IMPLEMENTATION.
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-values[ name = 'P_CARR' ]-value
       exp = 'AA' ).
+  ENDMETHOD.
+
+  METHOD selection_error_on_field.
+* AT SELECTION-SCREEN ON P_B sends E: the screen stays, the cursor goes to
+* P_B and only P_B is ready for input
+    DATA(ls_result) = zcl_gg_host=>run( NEW lcl_report( 'ON_FIELD' ) ).
+
+    cl_abap_unit_assert=>assert_true( ls_result-selection_active ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-selection_error
+      exp = VALUE zcl_gg_host=>ty_selection_error(
+        type = 'E' text = 'B is wrong' field = 'P_B' ready = 'P_B' ) ).
+    cl_abap_unit_assert=>assert_initial( ls_result-lines ).
+  ENDMETHOD.
+
+  METHOD selection_warning_confirmed.
+* W in AT SELECTION-SCREEN keeps the screen with every field ready; after
+* the confirmation the same input runs START-OF-SELECTION
+    DATA(ls_result) = zcl_gg_host=>run( NEW lcl_report( 'WARN' ) ).
+
+    cl_abap_unit_assert=>assert_true( ls_result-selection_active ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-selection_error
+      exp = VALUE zcl_gg_host=>ty_selection_error( type = 'W' text = 'Are you sure' ) ).
+    cl_abap_unit_assert=>assert_initial( ls_result-lines ).
+
+    ls_result = zcl_gg_host=>run(
+      io_report           = NEW lcl_report( 'WARN' )
+      iv_confirm_warnings = abap_true ).
+
+    cl_abap_unit_assert=>assert_false( ls_result-selection_active ).
+    cl_abap_unit_assert=>assert_initial( ls_result-selection_error ).
+    cl_abap_unit_assert=>assert_initial( ls_result-messages ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-lines
+      exp = VALUE zcl_gg_host_list=>ty_text_lines( ( `hello world` ) ) ).
+  ENDMETHOD.
+
+  METHOD selection_error_required.
+* an empty OBLIGATORY field: the cursor goes to it, every field stays ready
+    DATA(ls_result) = zcl_gg_host=>run( NEW lcl_report( 'REQUIRED' ) ).
+
+    cl_abap_unit_assert=>assert_true( ls_result-selection_active ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-selection_error-field
+      exp = 'P_CARR' ).
+    cl_abap_unit_assert=>assert_initial( ls_result-selection_error-ready ).
   ENDMETHOD.
 
   METHOD error_message_recorded.

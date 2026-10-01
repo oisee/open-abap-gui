@@ -8,6 +8,15 @@ CLASS zcl_gg_host DEFINITION PUBLIC FINAL CREATE PUBLIC.
 * unsupported control-flow operations remain explicit in ty_result.
 
   PUBLIC SECTION.
+* A MESSAGE E or W that kept the selection screen: which field the cursor
+* goes to and, after AT SELECTION-SCREEN ON <field>, the only field that is
+* ready for input (empty: all of them, as after AT SELECTION-SCREEN).
+    TYPES: BEGIN OF ty_selection_error,
+             type  TYPE zif_gg_session_types_v1=>ty_message_type,
+             text  TYPE string,
+             field TYPE zif_gg_selection_screen_types=>ty_name,
+             ready TYPE zif_gg_selection_screen_types=>ty_name,
+           END OF ty_selection_error.
     TYPES: BEGIN OF ty_result,
              lines               TYPE zcl_gg_host_list=>ty_text_lines,
              render_lines        TYPE zcl_gg_host_list=>ty_render_lines,
@@ -32,6 +41,7 @@ CLASS zcl_gg_host DEFINITION PUBLIC FINAL CREATE PUBLIC.
              transaction_call    TYPE zif_gg_session_types_v1=>ty_transaction_call,
              navigation          TYPE zif_gg_host_html_v1=>ty_navigation,
              selection_active    TYPE abap_bool,
+             selection_error     TYPE ty_selection_error,
              unsupported         TYPE string,
              session_id          TYPE string,
              page_id             TYPE string,
@@ -71,6 +81,7 @@ CLASS zcl_gg_host DEFINITION PUBLIC FINAL CREATE PUBLIC.
         iv_stop_before_start   TYPE abap_bool DEFAULT abap_false
         iv_present_selection   TYPE abap_bool DEFAULT abap_false
         iv_action_receipt      TYPE string OPTIONAL
+        iv_confirm_warnings    TYPE abap_bool DEFAULT abap_false
         is_resume_navigation   TYPE zif_gg_host_html_v1=>ty_navigation OPTIONAL
         is_resume_submit       TYPE zif_gg_session_types_v1=>ty_submit OPTIONAL
       RETURNING
@@ -362,6 +373,7 @@ CLASS zcl_gg_host IMPLEMENTATION.
     ENDIF.
 
     LOOP AT ct_values INTO DATA(ls_value).
+      cs_result-selection_error-ready = ls_value-name.
       io_session->set_event( 'AT SELECTION-SCREEN ON FIELD' ).
       io_report->at_selection_screen_on_field(
         EXPORTING
@@ -372,6 +384,7 @@ CLASS zcl_gg_host IMPLEMENTATION.
           ct_values  = ct_values ).
     ENDLOOP.
 
+    CLEAR cs_result-selection_error-ready.
     LOOP AT io_screen->get_blocks( ) INTO DATA(ls_block).
       io_session->set_event( 'AT SELECTION-SCREEN ON BLOCK' ).
       io_report->at_selection_screen_on_block(
@@ -462,6 +475,8 @@ CLASS zcl_gg_host IMPLEMENTATION.
     DATA lt_elements TYPE zcl_gg_host_screen=>ty_elements.
     DATA lt_dynamic_lists TYPE zcl_gg_host_compatibility=>ty_selection_lists.
     DATA lv_stop_before_start TYPE abap_bool.
+    DATA lv_selection_phase TYPE abap_bool.
+    DATA lt_messages TYPE zcl_gg_host_session=>ty_messages.
 
     lv_session_id = COND #( WHEN iv_session_id IS INITIAL
       THEN next_run_id( ) ELSE iv_session_id ).
@@ -480,6 +495,9 @@ CLASS zcl_gg_host IMPLEMENTATION.
       iv_batch          = iv_batch
       it_request_values = it_input ).
     lo_list_session = lo_session->zif_gg_session_v1~get_list( ).
+    IF iv_confirm_warnings = abap_true.
+      lo_session->confirm_warnings( ).
+    ENDIF.
 
     TRY.
         lo_session->set_event( 'LOAD-OF-PROGRAM' ).
@@ -511,6 +529,7 @@ CLASS zcl_gg_host IMPLEMENTATION.
           lv_stop_before_start = abap_true.
         ENDIF.
 
+        lv_selection_phase = abap_true.
         run_selection_events(
           EXPORTING
             io_report           = io_report
@@ -555,6 +574,7 @@ CLASS zcl_gg_host IMPLEMENTATION.
             io_session = lo_session ).
         ENDIF.
 
+        lv_selection_phase = abap_false.
         start_or_stop(
           EXPORTING
             io_report                  = io_report
@@ -585,6 +605,19 @@ CLASS zcl_gg_host IMPLEMENTATION.
           io_session = lo_session ).
         lv_selection_screen_active = xsdbool(
           lx_flow->mv_kind = zcx_gg_control_flow=>kind_message ).
+        lt_messages = lo_session->get_messages( ).
+        IF lv_selection_phase = abap_true
+            AND lx_flow->mv_kind = zcx_gg_control_flow=>kind_message
+            AND lt_messages IS NOT INITIAL.
+          DATA(ls_last) = lt_messages[ lines( lt_messages ) ].
+          rs_result-selection_error-type = ls_last-type.
+          rs_result-selection_error-text = ls_last-text.
+          rs_result-selection_error-field = COND #(
+            WHEN ls_last-field IS NOT INITIAL THEN ls_last-field
+            ELSE rs_result-selection_error-ready ).
+        ELSE.
+          CLEAR rs_result-selection_error.
+        ENDIF.
     ENDTRY.
 
     DATA(lv_paused) = xsdbool(
