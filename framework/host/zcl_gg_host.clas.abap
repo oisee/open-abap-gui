@@ -81,7 +81,7 @@ CLASS zcl_gg_host DEFINITION PUBLIC FINAL CREATE PUBLIC.
         iv_stop_before_start   TYPE abap_bool DEFAULT abap_false
         iv_present_selection   TYPE abap_bool DEFAULT abap_false
         iv_action_receipt      TYPE string OPTIONAL
-        iv_confirm_warnings    TYPE abap_bool DEFAULT abap_false
+        iv_confirmed_warning   TYPE string OPTIONAL
         is_resume_navigation   TYPE zif_gg_host_html_v1=>ty_navigation OPTIONAL
         is_resume_submit       TYPE zif_gg_session_types_v1=>ty_submit OPTIONAL
       RETURNING
@@ -372,6 +372,16 @@ CLASS zcl_gg_host IMPLEMENTATION.
       RETURN.
     ENDIF.
 
+* the required fields are checked before the PAI events, as on a system:
+* an empty OBLIGATORY field is the first complaint
+    IF iv_initial_display = abap_false AND iv_ucomm <> 'ECAN'.
+      io_session->set_event( 'AT SELECTION-SCREEN' ).
+      validate_required(
+        it_states  = ct_states
+        it_values  = ct_values
+        io_session = io_session ).
+    ENDIF.
+
     LOOP AT ct_values INTO DATA(ls_value).
       cs_result-selection_error-ready = ls_value-name.
       io_session->set_event( 'AT SELECTION-SCREEN ON FIELD' ).
@@ -475,7 +485,6 @@ CLASS zcl_gg_host IMPLEMENTATION.
     DATA lt_elements TYPE zcl_gg_host_screen=>ty_elements.
     DATA lt_dynamic_lists TYPE zcl_gg_host_compatibility=>ty_selection_lists.
     DATA lv_stop_before_start TYPE abap_bool.
-    DATA lv_selection_phase TYPE abap_bool.
     DATA lt_messages TYPE zcl_gg_host_session=>ty_messages.
 
     lv_session_id = COND #( WHEN iv_session_id IS INITIAL
@@ -495,8 +504,8 @@ CLASS zcl_gg_host IMPLEMENTATION.
       iv_batch          = iv_batch
       it_request_values = it_input ).
     lo_list_session = lo_session->zif_gg_session_v1~get_list( ).
-    IF iv_confirm_warnings = abap_true.
-      lo_session->confirm_warnings( ).
+    IF iv_confirmed_warning IS NOT INITIAL.
+      lo_session->confirm_warning( iv_confirmed_warning ).
     ENDIF.
 
     TRY.
@@ -529,7 +538,6 @@ CLASS zcl_gg_host IMPLEMENTATION.
           lv_stop_before_start = abap_true.
         ENDIF.
 
-        lv_selection_phase = abap_true.
         run_selection_events(
           EXPORTING
             io_report           = io_report
@@ -567,14 +575,6 @@ CLASS zcl_gg_host IMPLEMENTATION.
           ENDLOOP.
         ENDLOOP.
 
-        IF lv_stop_before_start = abap_false AND iv_ucomm <> 'ECAN'.
-          validate_required(
-            it_states  = lt_states
-            it_values  = lt_values
-            io_session = lo_session ).
-        ENDIF.
-
-        lv_selection_phase = abap_false.
         start_or_stop(
           EXPORTING
             io_report                  = io_report
@@ -606,7 +606,11 @@ CLASS zcl_gg_host IMPLEMENTATION.
         lv_selection_screen_active = xsdbool(
           lx_flow->mv_kind = zcx_gg_control_flow=>kind_message ).
         lt_messages = lo_session->get_messages( ).
-        IF lv_selection_phase = abap_true
+        " a message of the PAI of the selection screen; PBO (OUTPUT) and the
+        " events before it and after START-OF-SELECTION are not
+        DATA(lv_event) = lo_session->get_event( ).
+        IF lv_event CP 'AT SELECTION-SCREEN*'
+            AND lv_event <> 'AT SELECTION-SCREEN OUTPUT'
             AND lx_flow->mv_kind = zcx_gg_control_flow=>kind_message
             AND lt_messages IS NOT INITIAL.
           DATA(ls_last) = lt_messages[ lines( lt_messages ) ].

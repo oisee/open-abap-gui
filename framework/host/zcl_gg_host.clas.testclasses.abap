@@ -48,7 +48,7 @@ CLASS lcl_report IMPLEMENTATION.
     lo_writer = writer( io_session ).
 
     CASE mv_mode.
-      WHEN 'HELLO' OR 'WARN'.
+      WHEN 'HELLO' OR 'WARN' OR 'WARN2' OR 'WARN_OUT'.
         lo_writer->write_field( VALUE #( text = 'hello world' ) ).
 
       WHEN 'ESCAPE'.
@@ -154,11 +154,21 @@ CLASS lcl_report IMPLEMENTATION.
           text       = 'Carrier'
           data_type  = VALUE #( typ = 'C' length = 3 )
           obligatory = abap_true ) ).
-      WHEN 'ON_FIELD' OR 'WARN'.
+      WHEN 'ON_FIELD' OR 'WARN' OR 'WARN2' OR 'WARN_OUT'.
         io_builder->add_parameter( VALUE #(
           name      = 'P_A'
           text      = 'A'
           data_type = VALUE #( typ = 'C' length = 3 ) ) ).
+        io_builder->add_parameter( VALUE #(
+          name      = 'P_B'
+          text      = 'B'
+          data_type = VALUE #( typ = 'C' length = 3 ) ) ).
+      WHEN 'ORDER'.
+        io_builder->add_parameter( VALUE #(
+          name       = 'P_A'
+          text       = 'A'
+          data_type  = VALUE #( typ = 'C' length = 3 )
+          obligatory = abap_true ) ).
         io_builder->add_parameter( VALUE #(
           name      = 'P_B'
           text      = 'B'
@@ -189,6 +199,11 @@ CLASS lcl_report IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_report_v1~at_selection_screen_output.
+    IF mv_mode = 'WARN_OUT'.
+      io_session->message( VALUE #(
+        type = zif_gg_session_types_v1=>message_type_warning
+        text = 'Shown in PBO' ) ).
+    ENDIF.
     IF mv_mode = 'OUTPUT'.
       ct_values[ name = 'P_CARR' ]-value = 'OUT'.
       ct_states[ name = 'P_CARR' ]-visible = abap_false.
@@ -197,10 +212,15 @@ CLASS lcl_report IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_report_v1~at_selection_screen.
-    IF mv_mode = 'WARN'.
+    IF mv_mode = 'WARN' OR mv_mode = 'WARN2'.
       io_session->message( VALUE #(
         type = zif_gg_session_types_v1=>message_type_warning
         text = 'Are you sure' ) ).
+    ENDIF.
+    IF mv_mode = 'WARN2'.
+      io_session->message( VALUE #(
+        type = zif_gg_session_types_v1=>message_type_warning
+        text = 'Really sure' ) ).
     ENDIF.
     IF mv_mode = 'OUTPUT'.
       io_session->message( VALUE #(
@@ -210,7 +230,7 @@ CLASS lcl_report IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_report_v1~at_selection_screen_on_field.
-    IF mv_mode = 'ON_FIELD' AND iv_name = 'P_B'.
+    IF ( mv_mode = 'ON_FIELD' OR mv_mode = 'ORDER' ) AND iv_name = 'P_B'.
       io_session->message( VALUE #(
         type = zif_gg_session_types_v1=>message_type_error
         text = 'B is wrong' ) ).
@@ -299,6 +319,9 @@ CLASS ltcl_host DEFINITION FINAL FOR TESTING DURATION SHORT RISK LEVEL HARMLESS.
     METHODS selection_error_on_field FOR TESTING.
     METHODS selection_warning_confirmed FOR TESTING.
     METHODS selection_error_required FOR TESTING.
+    METHODS selection_second_warning FOR TESTING.
+    METHODS selection_required_first FOR TESTING.
+    METHODS selection_output_warning FOR TESTING.
 
 ENDCLASS.
 
@@ -391,8 +414,8 @@ CLASS ltcl_host IMPLEMENTATION.
     cl_abap_unit_assert=>assert_initial( ls_result-lines ).
 
     ls_result = zcl_gg_host=>run(
-      io_report           = NEW lcl_report( 'WARN' )
-      iv_confirm_warnings = abap_true ).
+      io_report            = NEW lcl_report( 'WARN' )
+      iv_confirmed_warning = `Are you sure` ).
 
     cl_abap_unit_assert=>assert_false( ls_result-selection_active ).
     cl_abap_unit_assert=>assert_initial( ls_result-selection_error ).
@@ -400,6 +423,37 @@ CLASS ltcl_host IMPLEMENTATION.
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-lines
       exp = VALUE zcl_gg_host_list=>ty_text_lines( ( `hello world` ) ) ).
+  ENDMETHOD.
+
+  METHOD selection_second_warning.
+* confirming the first warning does not confirm the next one
+    DATA(ls_result) = zcl_gg_host=>run(
+      io_report            = NEW lcl_report( 'WARN2' )
+      iv_confirmed_warning = `Are you sure` ).
+
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-selection_error
+      exp = VALUE zcl_gg_host=>ty_selection_error( type = 'W' text = 'Really sure' ) ).
+    cl_abap_unit_assert=>assert_initial( ls_result-lines ).
+  ENDMETHOD.
+
+  METHOD selection_required_first.
+* an empty OBLIGATORY field is checked before AT SELECTION-SCREEN ON P_B
+    DATA(ls_result) = zcl_gg_host=>run(
+      io_report = NEW lcl_report( 'ORDER' )
+      it_input  = VALUE #( ( name = 'P_B' value = 'BAD' ) ) ).
+
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-selection_error-field
+      exp = 'P_A' ).
+    cl_abap_unit_assert=>assert_initial( ls_result-selection_error-ready ).
+  ENDMETHOD.
+
+  METHOD selection_output_warning.
+* a message of AT SELECTION-SCREEN OUTPUT is no selection-screen error
+    DATA(ls_result) = zcl_gg_host=>run( NEW lcl_report( 'WARN_OUT' ) ).
+
+    cl_abap_unit_assert=>assert_initial( ls_result-selection_error ).
   ENDMETHOD.
 
   METHOD selection_error_required.

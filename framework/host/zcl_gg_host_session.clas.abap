@@ -40,10 +40,17 @@ CLASS zcl_gg_host_session DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING
         iv_event TYPE zif_gg_session_types_v1=>ty_event.
 
-* The user pressed Enter on a selection screen that showed a warning: a
-* MESSAGE W of the selection-screen events now lets the event go on, as
-* SAP GUI does after the confirmation.
-    METHODS confirm_warnings.
+* The user pressed Enter on a selection screen that showed this warning:
+* the MESSAGE W with this text in the selection-screen events now lets the
+* event go on, as SAP GUI does after the confirmation. Another warning
+* after it is still sent.
+    METHODS confirm_warning
+      IMPORTING
+        iv_text TYPE string.
+
+    METHODS get_event
+      RETURNING
+        VALUE(rv_event) TYPE zif_gg_session_types_v1=>ty_event.
 
     METHODS get_messages
       RETURNING
@@ -115,7 +122,7 @@ CLASS zcl_gg_host_session DEFINITION PUBLIC FINAL CREATE PUBLIC.
     DATA mo_compatibility TYPE REF TO zif_gg_compatibility_v1.
     DATA mv_program   TYPE zif_gg_session_types_v1=>ty_program.
     DATA mv_event     TYPE zif_gg_session_types_v1=>ty_event.
-    DATA mv_confirm_warnings TYPE abap_bool.
+    DATA mv_confirmed_warning TYPE string.
     DATA mv_batch     TYPE abap_bool.
     DATA mv_processor TYPE zif_gg_session_types_v1=>ty_processor.
     DATA mv_screen    TYPE zif_gg_dynpro_types_v1=>ty_screen_number.
@@ -164,8 +171,12 @@ CLASS zcl_gg_host_session IMPLEMENTATION.
     mv_event = iv_event.
   ENDMETHOD.
 
-  METHOD confirm_warnings.
-    mv_confirm_warnings = abap_true.
+  METHOD confirm_warning.
+    mv_confirmed_warning = iv_text.
+  ENDMETHOD.
+
+  METHOD get_event.
+    rv_event = mv_event.
   ENDMETHOD.
 
   METHOD get_messages.
@@ -316,8 +327,10 @@ CLASS zcl_gg_host_session IMPLEMENTATION.
       RETURN.
     ENDIF.
     IF ls_message-type = zif_gg_session_types_v1=>message_type_warning
-        AND mv_confirm_warnings = abap_true
-        AND mv_event CP 'AT SELECTION-SCREEN*'.
+        AND mv_confirmed_warning IS NOT INITIAL
+        AND ls_message-text = mv_confirmed_warning
+        AND mv_event CP 'AT SELECTION-SCREEN*'
+        AND mv_event <> 'AT SELECTION-SCREEN OUTPUT'.
       RETURN.
     ENDIF.
     APPEND ls_message TO mt_messages.
