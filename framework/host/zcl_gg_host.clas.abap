@@ -486,6 +486,8 @@ CLASS zcl_gg_host IMPLEMENTATION.
     DATA lt_dynamic_lists TYPE zcl_gg_host_compatibility=>ty_selection_lists.
     DATA lv_stop_before_start TYPE abap_bool.
     DATA lt_messages TYPE zcl_gg_host_session=>ty_messages.
+    DATA lt_confirmed TYPE string_table.
+    DATA lv_confirmed TYPE string.
 
     lv_session_id = COND #( WHEN iv_session_id IS INITIAL
       THEN next_run_id( ) ELSE iv_session_id ).
@@ -507,8 +509,8 @@ CLASS zcl_gg_host IMPLEMENTATION.
 * the texts of the warnings the user confirmed with these values, one per
 * line: a run starts the events over, so every one of them is passed again
     IF iv_confirmed_warnings IS NOT INITIAL.
-      SPLIT iv_confirmed_warnings AT cl_abap_char_utilities=>newline INTO TABLE DATA(lt_confirmed).
-      LOOP AT lt_confirmed INTO DATA(lv_confirmed).
+      SPLIT iv_confirmed_warnings AT cl_abap_char_utilities=>newline INTO TABLE lt_confirmed.
+      LOOP AT lt_confirmed INTO lv_confirmed.
         lo_session->confirm_warning( lv_confirmed ).
       ENDLOOP.
     ENDIF.
