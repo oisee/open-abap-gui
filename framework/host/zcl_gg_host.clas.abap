@@ -81,7 +81,7 @@ CLASS zcl_gg_host DEFINITION PUBLIC FINAL CREATE PUBLIC.
         iv_stop_before_start   TYPE abap_bool DEFAULT abap_false
         iv_present_selection   TYPE abap_bool DEFAULT abap_false
         iv_action_receipt      TYPE string OPTIONAL
-        iv_confirmed_warning   TYPE string OPTIONAL
+        iv_confirmed_warnings  TYPE string OPTIONAL
         is_resume_navigation   TYPE zif_gg_host_html_v1=>ty_navigation OPTIONAL
         is_resume_submit       TYPE zif_gg_session_types_v1=>ty_submit OPTIONAL
       RETURNING
@@ -504,8 +504,13 @@ CLASS zcl_gg_host IMPLEMENTATION.
       iv_batch          = iv_batch
       it_request_values = it_input ).
     lo_list_session = lo_session->zif_gg_session_v1~get_list( ).
-    IF iv_confirmed_warning IS NOT INITIAL.
-      lo_session->confirm_warning( iv_confirmed_warning ).
+* the texts of the warnings the user confirmed with these values, one per
+* line: a run starts the events over, so every one of them is passed again
+    IF iv_confirmed_warnings IS NOT INITIAL.
+      SPLIT iv_confirmed_warnings AT cl_abap_char_utilities=>newline INTO TABLE DATA(lt_confirmed).
+      LOOP AT lt_confirmed INTO DATA(lv_confirmed).
+        lo_session->confirm_warning( lv_confirmed ).
+      ENDLOOP.
     ENDIF.
 
     TRY.

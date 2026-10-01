@@ -40,10 +40,10 @@ CLASS zcl_gg_host_session DEFINITION PUBLIC FINAL CREATE PUBLIC.
       IMPORTING
         iv_event TYPE zif_gg_session_types_v1=>ty_event.
 
-* The user pressed Enter on a selection screen that showed this warning:
-* the MESSAGE W with this text in the selection-screen events now lets the
-* event go on, as SAP GUI does after the confirmation. Another warning
-* after it is still sent.
+* The user pressed Enter on a selection screen that showed these warnings:
+* a MESSAGE W with one of these texts in the selection-screen events now
+* lets the event go on, as SAP GUI does after the confirmation. A warning
+* not confirmed yet is still sent.
     METHODS confirm_warning
       IMPORTING
         iv_text TYPE string.
@@ -122,7 +122,7 @@ CLASS zcl_gg_host_session DEFINITION PUBLIC FINAL CREATE PUBLIC.
     DATA mo_compatibility TYPE REF TO zif_gg_compatibility_v1.
     DATA mv_program   TYPE zif_gg_session_types_v1=>ty_program.
     DATA mv_event     TYPE zif_gg_session_types_v1=>ty_event.
-    DATA mv_confirmed_warning TYPE string.
+    DATA mt_confirmed_warnings TYPE string_table.
     DATA mv_batch     TYPE abap_bool.
     DATA mv_processor TYPE zif_gg_session_types_v1=>ty_processor.
     DATA mv_screen    TYPE zif_gg_dynpro_types_v1=>ty_screen_number.
@@ -172,7 +172,7 @@ CLASS zcl_gg_host_session IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD confirm_warning.
-    mv_confirmed_warning = iv_text.
+    APPEND iv_text TO mt_confirmed_warnings.
   ENDMETHOD.
 
   METHOD get_event.
@@ -327,8 +327,7 @@ CLASS zcl_gg_host_session IMPLEMENTATION.
       RETURN.
     ENDIF.
     IF ls_message-type = zif_gg_session_types_v1=>message_type_warning
-        AND mv_confirmed_warning IS NOT INITIAL
-        AND ls_message-text = mv_confirmed_warning
+        AND line_exists( mt_confirmed_warnings[ table_line = ls_message-text ] )
         AND mv_event CP 'AT SELECTION-SCREEN*'
         AND mv_event <> 'AT SELECTION-SCREEN OUTPUT'.
       RETURN.

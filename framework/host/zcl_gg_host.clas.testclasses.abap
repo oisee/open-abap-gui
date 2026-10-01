@@ -414,8 +414,8 @@ CLASS ltcl_host IMPLEMENTATION.
     cl_abap_unit_assert=>assert_initial( ls_result-lines ).
 
     ls_result = zcl_gg_host=>run(
-      io_report            = NEW lcl_report( 'WARN' )
-      iv_confirmed_warning = `Are you sure` ).
+      io_report             = NEW lcl_report( 'WARN' )
+      iv_confirmed_warnings = `Are you sure` ).
 
     cl_abap_unit_assert=>assert_false( ls_result-selection_active ).
     cl_abap_unit_assert=>assert_initial( ls_result-selection_error ).
@@ -428,13 +428,23 @@ CLASS ltcl_host IMPLEMENTATION.
   METHOD selection_second_warning.
 * confirming the first warning does not confirm the next one
     DATA(ls_result) = zcl_gg_host=>run(
-      io_report            = NEW lcl_report( 'WARN2' )
-      iv_confirmed_warning = `Are you sure` ).
+      io_report             = NEW lcl_report( 'WARN2' )
+      iv_confirmed_warnings = `Are you sure` ).
 
     cl_abap_unit_assert=>assert_equals(
       act = ls_result-selection_error
       exp = VALUE zcl_gg_host=>ty_selection_error( type = 'W' text = 'Really sure' ) ).
     cl_abap_unit_assert=>assert_initial( ls_result-lines ).
+
+* both confirmed: START-OF-SELECTION runs
+    ls_result = zcl_gg_host=>run(
+      io_report             = NEW lcl_report( 'WARN2' )
+      iv_confirmed_warnings = `Are you sure` && cl_abap_char_utilities=>newline && `Really sure` ).
+
+    cl_abap_unit_assert=>assert_false( ls_result-selection_active ).
+    cl_abap_unit_assert=>assert_equals(
+      act = ls_result-lines
+      exp = VALUE zcl_gg_host_list=>ty_text_lines( ( `hello world` ) ) ).
   ENDMETHOD.
 
   METHOD selection_required_first.
