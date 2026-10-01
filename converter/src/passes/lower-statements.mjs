@@ -1056,6 +1056,7 @@ function bridgeLocalConstructors(statement, context) {
 }
 
 export function lowerStatement(original, context) {
+  if (original.nativeText !== undefined) return original.nativeText;
   const statement = bridgeLocalStaticCalls(bridgeLocalConstructors(original, context), context);
   const lowered = lowerSingleStatement(statement, context);
   if (statement.kind !== "SetHandler" || typeof lowered !== "string") return lowered;

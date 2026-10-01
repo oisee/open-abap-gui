@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import {NATIVE_STATEMENTS, nativeStatementText, resolvedSelectionPositions} from "./passes/native-passthrough.mjs";
 import { normalizeOptions, defaultClassName, defaultTransactionCode, normalizeObjectName, normalizeTransactionCode } from "./options.mjs";
 import { diagnostic, sortDiagnostics } from "./diagnostics.mjs";
 import { resolveSources } from "./source-resolver.mjs";
@@ -205,6 +206,17 @@ function buildReportIR(parsed, resolved, options, diagnostics) {
     .filter((statement) => !statement.localClassName && !moduleStatements.has(statement))));
   ir.sourceIndex = buildSourceIndex(ir);
   ir.statePlan = buildStatePlan(ir);
+  if (options.nativePassthrough) {
+    const references = resolvedSelectionPositions(parsed, ir.statePlan.selectionState);
+    for (const unit of parsed.units) {
+      for (const statement of unit.statements) {
+        if (!NATIVE_STATEMENTS.has(statement.kind)) continue;
+        const target = allStatements.find((item) => item.filename === statement.filename
+          && item.span.startOffset === statement.span.startOffset && item.kind === statement.kind);
+        if (target) target.nativeText = nativeStatementText(statement, unit.source, ir.statePlan.selectionState, references);
+      }
+    }
+  }
   ir.references = analyzeReferences(ir);
   ir.continuations = collectContinuations(allStatements, [
     ...ir.statePlan.globals,
