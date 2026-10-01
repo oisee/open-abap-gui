@@ -1,4 +1,5 @@
 import fs from "node:fs/promises";
+import {NATIVE_STATEMENTS, nativeStatementText, resolvedSelectionPositions} from "./passes/native-passthrough.mjs";
 import { normalizeOptions, defaultClassName, defaultTransactionCode, normalizeObjectName, normalizeTransactionCode } from "./options.mjs";
 import { diagnostic, sortDiagnostics } from "./diagnostics.mjs";
 import { resolveSources } from "./source-resolver.mjs";
@@ -6,6 +7,9 @@ import { parseUnits, readConfig } from "./parser.mjs";
 import { emptyReportIR } from "./ir/report-ir.mjs";
 import { classifyProgram } from "./passes/classify-program.mjs";
 import { collectDeclarations } from "./passes/collect-declarations.mjs";
+import { liftInlineDeclarations } from "./passes/lift-inline-declarations.mjs";
+import { dictionaryIndex, lazyProgramScope } from "./passes/program-scope.mjs";
+import { resolveSelectionTypes } from "./passes/resolve-selection-types.mjs";
 import { collectSelectionScreens } from "./passes/collect-selection-screens.mjs";
 import { collectEvents } from "./passes/collect-events.mjs";
 import { collectLocalClasses } from "./passes/collect-local-classes.mjs";
@@ -29,8 +33,8 @@ import { withoutLiteralTemplateText } from "./passes/lower-statements.mjs";
 
 const SAFE_ENTRY_FAILURE_CODES = new Set([
   "GGCONV-E100", "GGCONV-E101", "GGCONV-E102", "GGCONV-E103", "GGCONV-E104",
-  "GGCONV-E105", "GGCONV-E106", "GGCONV-E107", "GGCONV-E108", "GGCONV-E109",
-  "GGCONV-E201", "GGCONV-E202", "GGCONV-E203", "GGCONV-E204", "GGCONV-E205", "GGCONV-E301",
+  "GGCONV-E106", "GGCONV-E107", "GGCONV-E108", "GGCONV-E109",
+  "GGCONV-E201", "GGCONV-E202", "GGCONV-E203", "GGCONV-E204", "GGCONV-E205",
   "GGCONV-E502", "GGCONV-E503",
 ]);
 
@@ -195,8 +199,24 @@ function buildReportIR(parsed, resolved, options, diagnostics) {
     ...(ir.dynamicAlv?.fieldSymbols ?? []),
   ])].sort();
   ir.modules = collectModules(allStatements);
+  const moduleStatements = new Set(ir.modules.flatMap((module) => module.statements));
+  const programScope = lazyProgramScope(parsed.units, parsed.config, dictionaryIndex(options.dictionaryFiles));
+  ir.declarations.push(...liftInlineDeclarations(programScope, ir.eventBlocks
+    .flatMap((block) => block.statements)
+    .filter((statement) => !statement.localClassName && !moduleStatements.has(statement))));
   ir.sourceIndex = buildSourceIndex(ir);
   ir.statePlan = buildStatePlan(ir);
+  if (options.nativePassthrough) {
+    const references = resolvedSelectionPositions(parsed, ir.statePlan.selectionState);
+    for (const unit of parsed.units) {
+      for (const statement of unit.statements) {
+        if (!NATIVE_STATEMENTS.has(statement.kind)) continue;
+        const target = allStatements.find((item) => item.filename === statement.filename
+          && item.span.startOffset === statement.span.startOffset && item.kind === statement.kind);
+        if (target) target.nativeText = nativeStatementText(statement, unit.source, ir.statePlan.selectionState, references);
+      }
+    }
+  }
   ir.references = analyzeReferences(ir);
   ir.continuations = collectContinuations(allStatements, [
     ...ir.statePlan.globals,
@@ -209,7 +229,8 @@ function buildReportIR(parsed, resolved, options, diagnostics) {
       .filter((name) => !/^HIDE$/i.test(name))
       .map((name) => name.toUpperCase());
   }))].sort();
-  resolveTypes(ir, options, diagnostics);
+  resolveTypes(ir, options);
+  resolveSelectionTypes(ir, programScope);
   return ir;
 }
 
@@ -344,82 +365,74 @@ function applyFunctionKeyMetadata(ir) {
   }
 }
 
-function messageMetadataEntry(metadata, id, number) {
-  if (!metadata) return undefined;
-  const classes = metadata instanceof Map ? metadata : metadata.messages ?? metadata.classes ?? metadata;
-  const messageClass = classes instanceof Map
-    ? classes.get(id) ?? classes.get(id.toUpperCase())
-    : classes?.[id] ?? classes?.[id.toUpperCase()];
-  if (!messageClass) return undefined;
-  const messages = messageClass instanceof Map ? messageClass : messageClass.messages ?? messageClass;
-  return messages instanceof Map
-    ? messages.get(number) ?? messages.get(String(number).padStart(3, "0"))
-    : messages?.[number] ?? messages?.[String(number).padStart(3, "0")];
-}
-
-function applyMessageMetadata(ir, options, diagnostics) {
-  const references = ir.statements.map((statement) => {
-    const match = /\bMESSAGE\s+(?:[AEISWX])?(\d{3})\(([A-Z0-9_\/]+)\)/i.exec(statement.text);
-    return match ? { statement, id: match[2].toUpperCase(), number: match[1] } : undefined;
-  }).filter(Boolean);
-  if (!references.length) return;
-  const metadata = options.messageMetadata ?? options.messageClasses ?? options.messages;
-  for (const { statement, id, number } of references) {
-    const entry = messageMetadataEntry(metadata, id, number);
-    if (entry) continue;
-    if (metadata) {
-      diagnostics.push(diagnostic({
-        code: "GGCONV-E306",
-        filename: statement.filename,
-        start: statement.span.start,
-        end: statement.span.end,
-        construct: `${id}(${number})`,
-        message: `message text for ${id}(${number}) was not supplied by message metadata`,
-        suggestion: "Pass messageMetadata with the message class and three-digit message number, or keep the runtime message class available.",
-        phase: "messages",
-      }));
-    } else {
-      diagnostics.push(diagnostic({
-        code: "GGCONV-I101",
-        severity: "info",
-        filename: statement.filename,
-        start: statement.span.start,
-        end: statement.span.end,
-        construct: `${id}(${number})`,
-        message: `message text for ${id}(${number}) remains an external runtime dependency`,
-        suggestion: "Pass messageMetadata to make the message text available during conversion and validation.",
-        phase: "messages",
-      }));
-    }
+// ZCL_FOO -> ZCL_FOO_1, _2, ...; the stem is shortened to keep 30 characters.
+function nextFreeClassName(name, taken) {
+  for (let index = 1; ; index++) {
+    const suffix = `_${index}`;
+    const candidate = `${name.slice(0, 30 - suffix.length)}${suffix}`;
+    if (!taken.has(candidate)) return candidate;
   }
-  ir.messageMetadata = metadata ? { supplied: true } : { supplied: false, references: references.map(({ id, number }) => `${id}(${number})`).sort() };
 }
 
 function validateNames(ir, options, diagnostics) {
   let className = options.className ? options.className.toUpperCase() : defaultClassName(ir.programName ?? "");
+  let renamedFrom;
   if (!className) {
     diagnostics.push(diagnostic({ code: "GGCONV-E101", filename: options.filename, construct: "target class", message: "a target class name is required for this report name", suggestion: "Pass className/--class with a valid ABAP global class name.", phase: "options" }));
   } else {
     try {
       className = normalizeObjectName(className, "class");
-      const existingNames = Array.isArray(options.existingClassNames) ? options.existingClassNames : Array.isArray(options.existingClasses) ? options.existingClasses : [];
-      if (existingNames.map((name) => String(name).toUpperCase()).includes(className)) {
+      const existingNames = new Set((Array.isArray(options.existingClassNames) ? options.existingClassNames : Array.isArray(options.existingClasses) ? options.existingClasses : [])
+        .map((name) => String(name).toUpperCase()));
+      if (existingNames.has(className) && options.className) {
+        // An explicit name is what the caller asked for, so it is not replaced.
         diagnostics.push(diagnostic({ code: "GGCONV-E106", filename: options.filename, construct: className, message: `target class ${className} already exists`, suggestion: "Choose a different target class or perform an explicit, separately authorized replacement.", phase: "options" }));
+      } else if (existingNames.has(className)) {
+        renamedFrom = className;
+        className = nextFreeClassName(className, existingNames);
       }
     } catch (error) {
       diagnostics.push(diagnostic({ code: "GGCONV-E101", filename: options.filename, construct: className, message: error.message, suggestion: "Use an uppercase ABAP class name of at most 30 characters.", phase: "options" }));
     }
   }
-  let transactionCode = options.transactionCode?.toUpperCase() ?? defaultTransactionCode(ir.programName ?? "");
+  // A report gets a transaction code only when one is given or a transaction
+  // object starts it; otherwise it is generated with zif_gg_program_v1 and
+  // listed as a report without a transaction. A module pool can only be
+  // started through a transaction, so it defaults to its program name.
+  const programRegistered = ir.programKind === "report" && Boolean(ir.programName);
+  const withoutTransaction = programRegistered
+    ? "the class is generated without zif_gg_transaction_v1, as a report without a transaction"
+    : "the class is generated without zif_gg_transaction_v1, so it cannot be started as a transaction and the transaction registry cannot resolve a SUBMIT of it";
+  let transactionCode;
   if (options.transactionCode) {
     try {
       transactionCode = normalizeTransactionCode(options.transactionCode);
     } catch (error) {
-      diagnostics.push(diagnostic({ code: "GGCONV-E105", filename: options.filename, construct: "transaction code", message: error.message, suggestion: "Pass a valid scaffold transaction code.", phase: "options" }));
-      transactionCode = undefined;
+      diagnostics.push(diagnostic({ code: "GGCONV-W105", severity: "warning", filename: options.filename, construct: "transaction code", message: `${error.message}; ${withoutTransaction}`, suggestion: "Pass a valid scaffold transaction code.", phase: "options" }));
     }
+  } else if (ir.programKind === "module-pool") {
+    transactionCode = defaultTransactionCode(ir.programName ?? "");
+    if (!transactionCode) diagnostics.push(diagnostic({ code: "GGCONV-W105", severity: "warning", filename: options.filename, construct: "transaction code", message: `the program name cannot be used as a scaffold transaction code; ${withoutTransaction}`, suggestion: "Pass transactionCode/--tcode explicitly.", phase: "options" }));
   }
-  if (!transactionCode) diagnostics.push(diagnostic({ code: "GGCONV-E105", filename: options.filename, construct: "transaction code", message: "the report name cannot be used as a scaffold transaction code", suggestion: "Pass transactionCode/--tcode explicitly.", phase: "options" }));
+  if (renamedFrom) {
+    // SUBMIT derives the class from the program name, so a renamed class is
+    // only found through the program in its transaction or program metadata.
+    const location = options.existingClassFiles?.[renamedFrom];
+    const reachability = transactionCode
+      ? "SUBMIT finds it through the transaction registry"
+      : programRegistered
+        ? "SUBMIT finds it through the program registry"
+        : "without a transaction code, SUBMIT cannot find it";
+    diagnostics.push(diagnostic({
+      code: "GGCONV-W106",
+      severity: "warning",
+      filename: options.filename,
+      construct: renamedFrom,
+      message: `class ${renamedFrom} already exists${location ? ` in ${location}` : ""}; the report is generated as ${className} instead, and ${reachability}`,
+      suggestion: "Pass className/--class to choose the name yourself.",
+      phase: "options",
+    }));
+  }
   ir.targetClassName = className;
   ir.transactionCode = transactionCode;
   const metadataDescription = ir.screenMetadata?.reportTitle ?? ir.dynproMetadata?.reportTitle;
@@ -601,7 +614,6 @@ export async function convertProgram(input = {}) {
   applyTextPool(ir, options);
   applySelectionMetadata(ir, options);
   applyFunctionKeyMetadata(ir);
-  applyMessageMetadata(ir, options, diagnostics);
   diagnostics.push(...textFallbackDiagnostics(ir, options));
   diagnostics.push(...scanCapabilities(ir, ir.statements, options));
   reportTimeLimit();
@@ -610,7 +622,7 @@ export async function convertProgram(input = {}) {
   if (!["report", "module-pool"].includes(ir.programKind) && ir.programName) diagnostics.push(diagnostic({ code: "GGCONV-E102", filename: options.filename, construct: ir.programKind, message: `${ir.programKind} sources are not executable report inputs`, suggestion: "Pass a REPORT source, or convert includes and other program types in their owning executable program.", phase: "classify" }));
   if (ir.programKind === "module-pool" && !ir.dynproMetadata && !diagnostics.some((item) => item.code === "GGCONV-E502")) diagnostics.push(diagnostic({ code: "GGCONV-E502", filename: options.filename, construct: "PROGRAM", message: "dynpro metadata is required for module-pool conversion", suggestion: "Use the dynpro frontend with explicit screen metadata.", phase: "capability" }));
   const sorted = sortDiagnostics(diagnostics);
-  const supported = !sorted.some((item) => item.severity === "error" || item.code.startsWith("GGCONV-E")) && Boolean(ir.targetClassName) && Boolean(ir.transactionCode);
+  const supported = !sorted.some((item) => item.severity === "error" || item.code.startsWith("GGCONV-E")) && Boolean(ir.targetClassName);
   if (!supported && options.mode === "strict") {
     return { classSource: undefined, manifest: createManifest(ir, sorted, options), diagnostics: sorted, sourceMap: [], reportIR: ir, supported: false };
   }
@@ -641,7 +653,7 @@ export async function convertProgram(input = {}) {
     phase: "validate-generated",
   })).map((item) => mapGeneratedDiagnostic(item, sourceMap, `${ir.targetClassName}.clas.abap`)));
   const finalDiagnostics = sortDiagnostics(diagnostics);
-  const finalSupported = !finalDiagnostics.some((item) => item.severity === "error" || item.code.startsWith("GGCONV-E")) && Boolean(ir.targetClassName) && Boolean(ir.transactionCode);
+  const finalSupported = !finalDiagnostics.some((item) => item.severity === "error" || item.code.startsWith("GGCONV-E")) && Boolean(ir.targetClassName);
   const manifest = createManifest(ir, finalDiagnostics, options);
   const scaffold = lowerToScaffoldIR(ir, options, sourceMap);
   return { classSource, helperSources, manifest, diagnostics: finalDiagnostics, sourceMap, reportIR: ir, scaffoldIR: scaffold, supported: finalSupported };

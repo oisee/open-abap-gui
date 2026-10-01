@@ -207,6 +207,16 @@ function parseElement(node) {
   };
 }
 
+/**
+ * The name of the screen's OK-code field, the TYPE OKCODE element the Screen
+ * Painter lists last. The runtime writes the function code there before PAI;
+ * undefined when the screen declares none.
+ */
+export function screenOkCode(elements) {
+  const name = (elements ?? []).find((element) => element?.kind === "okcode" && element.name)?.name;
+  return name === undefined ? undefined : String(name).trim().toUpperCase();
+}
+
 function parseContainer(node) {
   const attributes = leafRecord(node);
   const position = positionAndGeometry(attributes);
@@ -487,8 +497,10 @@ function parseXmlMetadata(xml, { metadataFilename } = {}) {
       columns: integer(header.COLUMNS),
       lines: integer(header.LINES),
     };
+    const elements = children(child(item, "FIELDS"), "RPY_DYFATC").map(parseElement);
     return {
       number,
+      okCode: screenOkCode(elements),
       title: recordValue(header, "DESCRIPT"),
       description: recordValue(header, "DESCRIPT"),
       type: recordValue(header, "TYPE"),
@@ -500,7 +512,7 @@ function parseXmlMetadata(xml, { metadataFilename } = {}) {
       geometry,
       attributes: publicRecord(header),
       containers: children(child(item, "CONTAINERS"), "RPY_DYCATT").map(parseContainer),
-      elements: children(child(item, "FIELDS"), "RPY_DYFATC").map(parseElement),
+      elements,
     };
   });
   const textPool = parseTextPool(values);
@@ -601,3 +613,23 @@ export async function loadDynproMetadata({
 }
 
 export { parseFlowLogic };
+
+/**
+ * Read an abapGit TRAN object (`<tcode>.tran.xml`): the transaction code, the
+ * program it starts, and its short text. Returns undefined for a transaction
+ * that starts no program, such as a parameter transaction.
+ */
+export function parseTransactionXml(xml) {
+  const values = firstDescendant(parseXml(xml), "values");
+  const tstc = leafRecord(child(values, "TSTC"));
+  const transactionCode = recordValue(tstc, "TCODE");
+  const program = recordValue(tstc, "PGMNA");
+  if (!transactionCode || !program) return undefined;
+  const texts = children(values, "TSTCT").map(leafRecord);
+  const text = texts.find((item) => String(item.SPRSL ?? "").toUpperCase() === "E") ?? texts[0];
+  return {
+    transactionCode: transactionCode.toUpperCase(),
+    program: program.toUpperCase(),
+    ...(recordValue(text ?? {}, "TTEXT") ? { description: recordValue(text, "TTEXT") } : {}),
+  };
+}

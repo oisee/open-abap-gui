@@ -14,6 +14,7 @@ CLASS zcl_gg_transaction_registry DEFINITION PUBLIC FINAL CREATE PUBLIC.
              description TYPE string,
              class_name  TYPE string,
              kind        TYPE ty_kind,
+             program     TYPE zif_gg_session_types_v1=>ty_program,
            END OF ty_transaction.
     TYPES ty_transactions TYPE STANDARD TABLE OF ty_transaction WITH DEFAULT KEY.
 
@@ -24,6 +25,14 @@ CLASS zcl_gg_transaction_registry DEFINITION PUBLIC FINAL CREATE PUBLIC.
     CLASS-METHODS lookup
       IMPORTING
         iv_tcode              TYPE string
+      RETURNING
+        VALUE(rs_transaction) TYPE ty_transaction.
+
+* The transaction whose metadata names iv_program; when several do, the one
+* with the alphabetically first class name.
+    CLASS-METHODS lookup_program
+      IMPORTING
+        iv_program            TYPE zif_gg_session_types_v1=>ty_program
       RETURNING
         VALUE(rs_transaction) TYPE ty_transaction.
 
@@ -71,6 +80,21 @@ CLASS zcl_gg_transaction_registry IMPLEMENTATION.
       RETURN.
     ENDIF.
     READ TABLE mt_transactions INTO rs_transaction WITH KEY tcode = lv_tcode.
+  ENDMETHOD.
+
+  METHOD lookup_program.
+    DATA lv_program TYPE zif_gg_session_types_v1=>ty_program.
+
+    ensure_catalog( ).
+    lv_program = to_upper( condense( iv_program ) ).
+    IF lv_program IS INITIAL.
+      RETURN.
+    ENDIF.
+    LOOP AT mt_transactions INTO DATA(ls_transaction) WHERE program = lv_program.
+      IF rs_transaction IS INITIAL OR ls_transaction-class_name < rs_transaction-class_name.
+        rs_transaction = ls_transaction.
+      ENDIF.
+    ENDLOOP.
   ENDMETHOD.
 
   METHOD normalize_tcode.
@@ -133,25 +157,22 @@ CLASS zcl_gg_transaction_registry IMPLEMENTATION.
     SORT lt_names.
 
     LOOP AT lt_names INTO lv_class_name.
-      TRY.
-          CREATE OBJECT lo_object TYPE (lv_class_name).
-          lo_metadata ?= lo_object.
-        CATCH cx_root INTO DATA(lx_metadata).
-          RAISE EXCEPTION NEW zcx_gg_transaction_error(
-            iv_message = |Transaction class { lv_class_name } cannot provide metadata: { lx_metadata->get_text( ) }| ).
-      ENDTRY.
+* Discovery found the class through the interface, so a constructor or cast
+* failure here is an application crash and keeps its original exception.
+      CREATE OBJECT lo_object TYPE (lv_class_name).
+      lo_metadata ?= lo_object.
 
       CLEAR: lo_report, lo_dynpro, lv_report, lv_dynpro.
       TRY.
           lo_report ?= lo_object.
           lv_report = abap_true.
-        CATCH cx_root.
+        CATCH cx_sy_move_cast_error.
           CLEAR lo_report.
       ENDTRY.
       TRY.
           lo_dynpro ?= lo_object.
           lv_dynpro = abap_true.
-        CATCH cx_root.
+        CATCH cx_sy_move_cast_error.
           CLEAR lo_dynpro.
       ENDTRY.
       IF lv_report = abap_true AND lv_dynpro = abap_true.
@@ -211,6 +232,7 @@ CLASS zcl_gg_transaction_registry IMPLEMENTATION.
       ls_transaction-description = lv_description.
       ls_transaction-class_name = lv_class_name.
       ls_transaction-kind = COND #( WHEN lv_report = abap_true THEN kind_report ELSE kind_dynpro ).
+      ls_transaction-program = to_upper( condense( ls_metadata-program ) ).
       APPEND ls_transaction TO mt_transactions.
     ENDLOOP.
 

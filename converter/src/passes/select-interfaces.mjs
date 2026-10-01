@@ -1,3 +1,7 @@
+export function hasProgramMetadata(ir) {
+  return !ir.transactionCode && ir.programKind === "report" && Boolean(ir.programName);
+}
+
 export function selectInterfaces(ir) {
   const interfaces = new Set(ir.interfaces);
   if (ir.features.includes("list-processing")) interfaces.add("zif_gg_list_processing_v1");
@@ -9,6 +13,12 @@ export function selectInterfaces(ir) {
     interfaces.delete("zif_gg_screen_provider_v1");
     interfaces.add("zif_gg_dynpro_v1");
   }
+  // GGCONV-W105: a class without a transaction code must not register an
+  // empty one with the transaction registry.
+  if (!ir.transactionCode) interfaces.delete("zif_gg_transaction_v1");
+  // A report no transaction starts declares its program instead, so the
+  // workbench lists it and SUBMIT finds it.
+  if (hasProgramMetadata(ir)) interfaces.add("zif_gg_program_v1");
   ir.interfaces = [...interfaces].sort();
   return ir.interfaces;
 }

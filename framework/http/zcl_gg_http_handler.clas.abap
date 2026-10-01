@@ -175,6 +175,9 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
   METHOD if_http_extension~handle_request.
     DATA lv_method TYPE string.
 
+* Only the host's own transaction errors become a response. Any other
+* exception is an application crash and leaves unchanged, so the web entry
+* point terminates the process with the original stack.
     TRY.
         lv_method = server->request->get_method( ).
         TRANSLATE lv_method TO UPPER CASE.
@@ -199,10 +202,6 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
           server    = server
           iv_error  = lx_transaction_error->mv_message
           iv_status = 500 ).
-      CATCH cx_root INTO DATA(lx_error).
-        send_error(
-          server   = server
-          iv_error = lx_error->get_text( ) ).
     ENDTRY.
   ENDMETHOD.
 
@@ -215,6 +214,10 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
     DATA lo_workbench TYPE REF TO zif_gg_raw_html_v1.
     DATA lv_class_name TYPE string.
     DATA ls_transaction TYPE zcl_gg_transaction_registry=>ty_transaction.
+    DATA lv_program TYPE string.
+    DATA ls_program TYPE zcl_gg_program_registry=>ty_program.
+    DATA lo_program TYPE REF TO object.
+    DATA lo_report TYPE REF TO zif_gg_report_v1.
 
     lv_path = server->request->get_header_field( '~path' ).
     REPLACE FIRST OCCURRENCE OF '?' IN lv_path WITH ''.
@@ -260,6 +263,34 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
                              is_response = ls_response ).
       RETURN.
     ENDIF.
+    IF lv_path = '/program'.
+      server->request->get_form_fields_cs( CHANGING fields = lt_fields ).
+      lv_program = form_value( it_fields = lt_fields
+                               iv_name   = 'name' ).
+      ls_program = zcl_gg_program_registry=>lookup( iv_program = lv_program ).
+      IF ls_program-program IS INITIAL.
+        send_workbench_error(
+          server   = server
+          iv_error = |Unknown program: { lv_program }| ).
+        RETURN.
+      ENDIF.
+* The catalog already created the class and checked it is a report.
+      CREATE OBJECT lo_program TYPE (ls_program-class_name).
+      lo_report ?= lo_program.
+      ls_response = start_program(
+        io_report  = lo_report
+        iv_program = CONV #( ls_program-class_name ) ).
+      IF ls_response-valid = abap_false.
+        send_workbench_error(
+          server    = server
+          iv_error  = ls_response-error
+          iv_status = 500 ).
+        RETURN.
+      ENDIF.
+      send_runtime_response( server      = server
+                             is_response = ls_response ).
+      RETURN.
+    ENDIF.
     lv_class_name = substring( val = lv_path
                                off = 1 ).
     TRANSLATE lv_class_name TO UPPER CASE.
@@ -288,6 +319,7 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
     DATA ls_command TYPE zcl_gg_transaction_command=>ty_result.
     DATA ls_transaction TYPE zcl_gg_transaction_registry=>ty_transaction.
     DATA lo_transaction TYPE REF TO object.
+    DATA lo_workbench TYPE REF TO zif_gg_raw_html_v1.
     DATA ls_response TYPE zif_gg_host_html_v1=>ty_response.
 
     lv_path = server->request->get_header_field( '~path' ).
@@ -319,6 +351,15 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
           iv_session_id = lv_session_id
           iv_page_id    = lv_page_id
           iv_error      = ls_command-error ).
+        RETURN.
+      ENDIF.
+      IF ls_command-menu = abap_true.
+        IF lv_session_id IS NOT INITIAL.
+          zcl_gg_host_runtime=>close( lv_session_id ).
+        ENDIF.
+        lo_workbench = NEW zcl_gg_workbench( ).
+        send_html( server  = server
+                   iv_html = lo_workbench->get_html( ) ).
         RETURN.
       ENDIF.
       ls_transaction = zcl_gg_transaction_registry=>lookup( iv_tcode = CONV string( ls_command-tcode ) ).
@@ -937,6 +978,14 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
     IF mv_environment_ready = abap_true.
       RETURN.
     ENDIF.
+* An environment may install an OSQL test double, which moves every table,
+* REPOSRC included, into the double schema. Class discovery reads REPOSRC, so
+* the catalogs are built first; a catalog error surfaces where it is used.
+    TRY.
+        zcl_gg_transaction_registry=>get_all( ).
+        zcl_gg_program_registry=>get_all( ).
+      CATCH zcx_gg_transaction_error ##NO_HANDLER.
+    ENDTRY.
     lt_names = zcl_gg_class_discovery=>implementations_of( `ZIF_GG_HOST_ENVIRONMENT_V1` ).
     LOOP AT lt_names INTO lv_class_name.
       CREATE OBJECT lo_object TYPE (lv_class_name).
@@ -967,28 +1016,15 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
     DATA lo_report TYPE REF TO zif_gg_report_v1.
     DATA lo_dynpro TYPE REF TO zif_gg_dynpro_v1.
 
-    TRY.
-        CREATE OBJECT ro_object TYPE (is_transaction-class_name).
-      CATCH cx_root INTO DATA(lx_create_error).
-        RAISE EXCEPTION NEW zcx_gg_transaction_error(
-          iv_message = |Unable to start transaction { is_transaction-tcode } ({ is_transaction-class_name }): { lx_create_error->get_text( ) }| ).
-    ENDTRY.
+* The catalog already created the class and derived its kind from the
+* interfaces it implements, so a failure here is an application crash.
+    CREATE OBJECT ro_object TYPE (is_transaction-class_name).
 
     CASE is_transaction-kind.
       WHEN zcl_gg_transaction_registry=>kind_report.
-        TRY.
-            lo_report ?= ro_object.
-          CATCH cx_root.
-            RAISE EXCEPTION NEW zcx_gg_transaction_error(
-              iv_message = |Transaction { is_transaction-tcode } is not a report implementation| ).
-        ENDTRY.
+        lo_report ?= ro_object.
       WHEN zcl_gg_transaction_registry=>kind_dynpro.
-        TRY.
-            lo_dynpro ?= ro_object.
-          CATCH cx_root.
-            RAISE EXCEPTION NEW zcx_gg_transaction_error(
-              iv_message = |Transaction { is_transaction-tcode } is not a dynpro implementation| ).
-        ENDTRY.
+        lo_dynpro ?= ro_object.
       WHEN OTHERS.
         RAISE EXCEPTION NEW zcx_gg_transaction_error(
           iv_message = |Transaction { is_transaction-tcode } has an unsupported executable kind| ).
@@ -1008,22 +1044,12 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
 
     CASE is_transaction-kind.
       WHEN zcl_gg_transaction_registry=>kind_report.
-        TRY.
-            lo_report ?= lo_object.
-          CATCH cx_root.
-            RAISE EXCEPTION NEW zcx_gg_transaction_error(
-              iv_message = |Transaction { is_transaction-tcode } is not a report implementation| ).
-        ENDTRY.
+        lo_report ?= lo_object.
         rs_response = start_program(
           io_report  = lo_report
           iv_program = CONV #( is_transaction-class_name ) ).
       WHEN zcl_gg_transaction_registry=>kind_dynpro.
-        TRY.
-            lo_dynpro ?= lo_object.
-          CATCH cx_root.
-            RAISE EXCEPTION NEW zcx_gg_transaction_error(
-              iv_message = |Transaction { is_transaction-tcode } is not a dynpro implementation| ).
-        ENDTRY.
+        lo_dynpro ?= lo_object.
         rs_response = start_program(
           io_dynpro  = lo_dynpro
           iv_program = CONV #( is_transaction-class_name ) ).
@@ -1043,7 +1069,19 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD send_runtime_response.
-    IF is_response-valid = abap_true.
+    DATA ls_message TYPE zif_gg_session_types_v1=>ty_message.
+
+* A program the user started from the workbench has ended, so the user is
+* back at the workbench, with the program's last message as SAP shows it.
+    IF is_response-valid = abap_true AND is_response-ended = abap_true.
+      zcl_gg_host_runtime=>close( is_response-session_id ).
+      READ TABLE is_response-messages INTO ls_message INDEX lines( is_response-messages ).
+      send_html(
+        server  = server
+        iv_html = zcl_gg_workbench=>render_message(
+                    iv_message = ls_message-text
+                    iv_type    = ls_message-type ) ).
+    ELSEIF is_response-valid = abap_true.
       send_html(
         server  = server
         iv_html = is_response-html ).
@@ -1052,6 +1090,14 @@ CLASS zcl_gg_http_handler IMPLEMENTATION.
         server    = server
         iv_error  = is_response-error
         iv_status = 409 ).
+* A page the browser posted shows why the step failed in the shell; the
+* program's session stays as it was, so going back returns to it.
+    ELSEIF server->request->get_header_field( 'content-type' ) NS 'application/json'
+        AND server->request->get_method( ) = 'POST'.
+      send_workbench_error(
+        server    = server
+        iv_error  = is_response-error
+        iv_status = 400 ).
     ELSE.
       send_error(
         server   = server

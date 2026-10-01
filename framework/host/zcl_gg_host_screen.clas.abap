@@ -9,6 +9,7 @@ CLASS zcl_gg_host_screen DEFINITION PUBLIC FINAL CREATE PUBLIC.
     TYPES: BEGIN OF ty_block,
              block  TYPE zif_gg_selection_screen_types=>ty_block,
              depth  TYPE i,
+             parent TYPE i,
              screen TYPE zif_gg_selection_screen_types=>ty_screen_number,
            END OF ty_block.
     TYPES ty_blocks TYPE STANDARD TABLE OF ty_block WITH DEFAULT KEY.
@@ -39,6 +40,7 @@ CLASS zcl_gg_host_screen DEFINITION PUBLIC FINAL CREATE PUBLIC.
              length         TYPE i,
              line           TYPE i,
              block_depth    TYPE i,
+             block          TYPE i,
              visible_length TYPE i,
              for_field      TYPE zif_gg_selection_screen_types=>ty_name,
              modif_id       TYPE zif_gg_selection_screen_types=>ty_modif_id,
@@ -105,6 +107,7 @@ CLASS zcl_gg_host_screen DEFINITION PUBLIC FINAL CREATE PUBLIC.
     DATA mt_elements TYPE ty_elements.
     DATA mt_states TYPE zif_gg_selection_screen_types=>ty_states.
     DATA mv_block_depth TYPE i.
+    DATA mt_block_stack TYPE STANDARD TABLE OF i WITH DEFAULT KEY.
     DATA mv_line TYPE i.
     DATA mv_position TYPE i.
     DATA mv_in_line TYPE abap_bool.
@@ -230,8 +233,13 @@ CLASS zcl_gg_host_screen IMPLEMENTATION.
     ls_element-as_subscreen = iv_as_subscreen.
     ls_element-position = iv_position.
     ls_element-length = iv_length.
-    ls_element-line = mv_line.
+* Only elements between BEGIN OF LINE and END OF LINE share a line; any other
+* element is a line of its own, even after a SKIP or an earlier line block.
+    IF mv_in_line = abap_true.
+      ls_element-line = mv_line.
+    ENDIF.
     ls_element-block_depth = mv_block_depth.
+    READ TABLE mt_block_stack INTO ls_element-block INDEX lines( mt_block_stack ).
     ls_element-visible_length = iv_visible_length.
     ls_element-for_field = iv_for_field.
     ls_element-modif_id = iv_modif_id.
@@ -329,6 +337,23 @@ CLASS zcl_gg_host_screen IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_selection_screen_builder_v1~add_radiobutton.
+    DATA lv_ucomm TYPE zif_gg_selection_screen_types=>ty_ucomm.
+
+* USER-COMMAND is written on one button of a radio group and belongs to the
+* whole group: selecting any of its buttons raises it.
+    lv_ucomm = is_radiobutton-ucomm.
+    LOOP AT mt_states INTO DATA(ls_member) WHERE group1 = is_radiobutton-radio_group.
+      READ TABLE mt_elements ASSIGNING FIELD-SYMBOL(<ls_member>)
+        WITH KEY kind = 'RADIOBUTTON' name = ls_member-name.
+      IF sy-subrc <> 0.
+        CONTINUE.
+      ENDIF.
+      IF lv_ucomm IS INITIAL.
+        lv_ucomm = <ls_member>-ucomm.
+      ELSEIF <ls_member>-ucomm IS INITIAL.
+        <ls_member>-ucomm = lv_ucomm.
+      ENDIF.
+    ENDLOOP.
     add_value(
       iv_name  = is_radiobutton-name
       iv_value = CONV string( is_radiobutton-default ) ).
@@ -342,7 +367,7 @@ CLASS zcl_gg_host_screen IMPLEMENTATION.
       iv_kind     = 'RADIOBUTTON'
       iv_name     = is_radiobutton-name
       iv_text     = is_radiobutton-text
-      iv_ucomm    = is_radiobutton-ucomm
+      iv_ucomm    = lv_ucomm
       iv_modif_id = is_radiobutton-modif_id ).
   ENDMETHOD.
 
@@ -447,15 +472,21 @@ CLASS zcl_gg_host_screen IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD zif_gg_selection_screen_builder_v1~begin_block.
+    DATA lv_parent TYPE i.
+
+    READ TABLE mt_block_stack INTO lv_parent INDEX lines( mt_block_stack ).
     mv_block_depth = mv_block_depth + 1.
     APPEND VALUE #( block  = is_block
                     depth  = mv_block_depth
+                    parent = lv_parent
                     screen = COND #( WHEN mv_screen IS INITIAL THEN '1000' ELSE mv_screen ) ) TO mt_blocks.
+    APPEND lines( mt_blocks ) TO mt_block_stack.
   ENDMETHOD.
 
   METHOD zif_gg_selection_screen_builder_v1~end_block.
     IF mv_block_depth > 0.
       mv_block_depth = mv_block_depth - 1.
+      DELETE mt_block_stack INDEX lines( mt_block_stack ).
     ENDIF.
   ENDMETHOD.
 
@@ -510,6 +541,63 @@ CLASS zcl_gg_host_screen IMPLEMENTATION.
 
   METHOD zif_gg_selection_screen_builder_v1~end_screen.
     CLEAR mv_screen.
+  ENDMETHOD.
+
+  METHOD zif_gg_selection_screen_builder_v1~get_ddic_text.
+    DATA lo_type    TYPE REF TO cl_abap_typedescr.
+    DATA lo_table   TYPE REF TO cl_abap_tabledescr.
+    DATA lo_struct  TYPE REF TO cl_abap_structdescr.
+    DATA lo_element TYPE REF TO cl_abap_elemdescr.
+    DATA ls_field   TYPE dfies.
+
+    rv_text = iv_name.
+    lo_type = cl_abap_typedescr=>describe_by_data( ig_field ).
+* A select-option is a range table; its dictionary field is the LOW component.
+    IF lo_type->kind = cl_abap_typedescr=>kind_table.
+      lo_table ?= lo_type.
+      lo_type = lo_table->get_table_line_type( ).
+      IF lo_type->kind <> cl_abap_typedescr=>kind_struct.
+        RETURN.
+      ENDIF.
+      lo_struct ?= lo_type.
+      lo_struct->get_component_type(
+        EXPORTING
+          p_name              = 'LOW'
+        RECEIVING
+          p_descr_ref         = DATA(lo_low)
+        EXCEPTIONS
+          component_not_found = 1
+          OTHERS              = 2 ).
+      IF sy-subrc <> 0.
+        RETURN.
+      ENDIF.
+      lo_type = lo_low.
+    ENDIF.
+    IF lo_type->kind <> cl_abap_typedescr=>kind_elem OR lo_type->is_ddic_type( ) = abap_false.
+      RETURN.
+    ENDIF.
+    lo_element ?= lo_type.
+    lo_element->get_ddic_field(
+      RECEIVING
+        p_flddescr   = ls_field
+      EXCEPTIONS
+        not_found    = 1
+        no_ddic_type = 2
+        OTHERS       = 3 ).
+    IF sy-subrc <> 0.
+      RETURN.
+    ENDIF.
+* The medium field label, as SAP GUI shows it; the other labels and the
+* short description stand in when the data element leaves it empty.
+    IF ls_field-scrtext_m IS NOT INITIAL.
+      rv_text = ls_field-scrtext_m.
+    ELSEIF ls_field-scrtext_l IS NOT INITIAL.
+      rv_text = ls_field-scrtext_l.
+    ELSEIF ls_field-scrtext_s IS NOT INITIAL.
+      rv_text = ls_field-scrtext_s.
+    ELSEIF ls_field-fieldtext IS NOT INITIAL.
+      rv_text = ls_field-fieldtext.
+    ENDIF.
   ENDMETHOD.
 
 ENDCLASS.

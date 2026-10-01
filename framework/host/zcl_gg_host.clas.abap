@@ -632,17 +632,10 @@ CLASS zcl_gg_host IMPLEMENTATION.
       ENDIF.
 
       IF lv_submit_return = abap_true AND io_submit_report IS BOUND.
-        TRY.
-            lv_ended = resume_submit_return(
-              io_report        = io_report
-              io_submit_report = io_submit_report
-              io_session       = lo_session ).
-          CATCH cx_root INTO DATA(lx_submit_return).
-            lo_session->zif_gg_session_v1~message(
-              VALUE #( type = zif_gg_session_types_v1=>message_type_warning
-                       text = |Nested report return is unavailable: { lx_submit_return->get_text( ) }| ) ).
-            lv_ended = abap_false.
-        ENDTRY.
+        lv_ended = resume_submit_return(
+          io_report        = io_report
+          io_submit_report = io_submit_report
+          io_session       = lo_session ).
       ENDIF.
     ENDIF.
 
@@ -772,12 +765,15 @@ CLASS zcl_gg_host IMPLEMENTATION.
           OR ls_screen_call-modal-start_column > 0
           OR ls_screen_call-modal-end_row > 0
           OR ls_screen_call-modal-end_column > 0 ).
-      WHEN zcx_gg_control_flow=>kind_submit_return.
+      WHEN zcx_gg_control_flow=>kind_submit_return
+          OR zcx_gg_control_flow=>kind_submit.
         DATA(ls_submit_call) = io_session->get_submit_call( ).
         rs_navigation-target = ls_submit_call-program.
-      WHEN zcx_gg_control_flow=>kind_call_transaction.
+      WHEN zcx_gg_control_flow=>kind_call_transaction
+          OR zcx_gg_control_flow=>kind_leave_to_transaction.
         DATA(ls_transaction_call) = io_session->get_transaction_call( ).
         rs_navigation-target = ls_transaction_call-tcode.
+        rs_navigation-skip_first_screen = ls_transaction_call-skip_first_screen.
     ENDCASE.
   ENDMETHOD.
 

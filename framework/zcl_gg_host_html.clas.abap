@@ -268,12 +268,17 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-dialog-body\{flex:1;min-height:0;overflow:hidden;padding:4px;background:#fff;box-sizing:border-box;pointer-events:none;\}|.
     rv_html = rv_html && |.gg-dialog-body>.gg-control\{position:relative!important;left:0!important;top:0!important;width:100%!important;height:100%!important;pointer-events:none;\}|.
     rv_html = rv_html && |.gg-message-region,.gg-instruction-region\{display:flex;flex-direction:column;gap:4px;\}|.
+* Empty regions stay in the markup but take no space or flex gap.
+    rv_html = rv_html && |.gg-message-region:empty,.gg-status-region:has(>.gg-selection-status:empty)\{display:none;\}|.
     rv_html = rv_html && |.gg-action-row\{position:relative;z-index:30;display:flex;align-items:center;gap:8px;min-height:28px;padding:4px 0;border-top:1px solid var(--gg-border);box-sizing:border-box;\}|.
     rv_html = rv_html && |.gg-state-focused:focus,.gg-state-focused:focus-visible\{outline:2px solid #2668a3;outline-offset:2px;\}|.
     rv_html = rv_html && |.gg-state-selected,[aria-selected=true],[aria-current=true]\{background:#c7dced;color:#102f4d;\}|.
     rv_html = rv_html && |.gg-state-changed,[data-state~="changed"]\{box-shadow:inset 3px 0 #d4a000;\}|.
     rv_html = rv_html && |.gg-state-disabled,[disabled],[aria-disabled=true]\{opacity:.62;cursor:default;\}|.
-    rv_html = rv_html && |.gg-state-required,[required],[aria-required=true]\{border-color:#d4a000;\}|.
+* An empty required field carries the ticked box drawn at its right edge.
+* The browser does not enforce required (submits are formnovalidate), so
+* :invalid means empty here; disabled and read-only fields never match it.
+    rv_html = rv_html && |input[required]:is([type=text],[type=password]):invalid\{background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 12 12'%3E%3Crect x='.5' y='.5' width='11' height='11' rx='1.5' fill='%23fff' stroke='%235b7790'/%3E%3Cpath d='M3 6.2l2 2 4-4.4' fill='none' stroke='%232c618d' stroke-width='1.6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 4px center;background-size:12px 12px;\}|.
     rv_html = rv_html && |.gg-state-error,[aria-invalid=true],[data-state~="error"]\{border-color:#b00020;color:#8f001b;\}|.
     rv_html = rv_html && |.gg-state-warning,[data-state~="warning"]\{border-color:#c08100;color:#704700;\}|.
     rv_html = rv_html && |.gg-state-total\{font-weight:700;border-top:1px solid #6f879b;\}|.
@@ -335,6 +340,7 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-modal-header\{display:flex;align-items:center;justify-content:space-between;gap:16px;padding:10px 14px;background:linear-gradient(#f8fbfe,#e2edf7);border-bottom:1px solid #b4c8db;color:#174a80;font-size:14px;font-weight:650;\}|.
     rv_html = rv_html && |.gg-modal-kind\{font-size:11px;font-weight:400;color:#55738f;text-transform:uppercase;\}|.
     rv_html = rv_html && |.gg-modal-panel>.gg-page\{padding:12px 14px 16px;\}|.
+    rv_html = rv_html && |.gg-modal-footer\{display:flex;gap:6px;padding:8px 14px;border-top:1px solid #b4c8db;background:#dce8f3;\}|.
     rv_html = rv_html && |.gg-free-selection-modal\{position:fixed;inset:0;z-index:950;display:flex;align-items:center;justify-content:center;padding:24px;box-sizing:border-box;background:rgba(19,45,72,.48);backdrop-filter:blur(2px);\}|.
     rv_html = rv_html && |.gg-free-selection-modal--fullscreen\{align-items:stretch;justify-content:stretch;padding:12px;\}|.
     rv_html = rv_html && |.gg-free-selection-panel\{display:flex;flex-direction:column;width:min(900px,100%);max-height:calc(100vh - 48px);overflow:hidden;background:#fff;border:1px solid #7594b2;border-radius:4px;box-shadow:0 18px 48px rgba(18,52,84,.34);color:#1d2d3e;\}|.
@@ -350,7 +356,8 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-free-selection-tree-item:hover,.gg-free-selection-tree-item:focus-within\{border-color:#86a9cc;background:#eef6fd;\}|.
     rv_html = rv_html && |.gg-free-selection-row\{display:grid;grid-template-columns:minmax(9rem,1fr) 6.5rem 6.5rem minmax(7rem,1fr) minmax(7rem,1fr);gap:6px;align-items:center;margin-bottom:7px;\}|.
     rv_html = rv_html && |.gg-free-selection-row label\{color:#123b64;font-weight:600;\}|.
-    rv_html = rv_html && |.gg-free-selection-row input,.gg-free-selection-row select\{height:26px;min-width:0;padding:2px 5px;border:1px solid #8daac4;border-radius:2px;background:#fff1a6;color:#123b64;font:inherit;box-sizing:border-box;\}|.
+    rv_html = rv_html && |.gg-free-selection-row input,.gg-free-selection-row select\{height:26px;min-width:0;padding:2px 5px;border:1px solid #8daac4;border-radius:2px;background:var(--gg-input);color:#123b64;font:inherit;box-sizing:border-box;\}|.
+    rv_html = rv_html && |.gg-free-selection-row input:focus:not([readonly]),.gg-free-selection-row select:focus\{background-color:#fff1a6;\}|.
     rv_html = rv_html && |.gg-free-selection-actions\{display:flex;align-items:center;gap:8px;padding:10px 14px;border-top:1px solid #b4c8db;background:#e3eff8;\}|.
     rv_html = rv_html && |.gg-free-selection-actions button\{min-height:28px;padding:3px 14px;border:1px solid #8c8c8c;border-radius:2px;background:linear-gradient(#fffbd2,#fff3a3);color:#2b2a13;font:inherit;cursor:pointer;\}|.
     rv_html = rv_html && |.gg-free-selection-actions button:hover,.gg-free-selection-actions button:focus\{background:#fff;border-color:#5e8fbd;outline:0;\}|.
@@ -359,6 +366,7 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-selection\{max-width:100%;padding:0 0 16px;color:#123b64;\}|.
     rv_html = rv_html && |.gg-selection>form\{display:flex;flex-direction:column;gap:2px;\}|.
     rv_html = rv_html && |.gg-selection fieldset\{min-width:0;margin:.75rem 0;padding:.75rem;border:1px solid var(--gg-border-dark);border-radius:2px;background:linear-gradient(var(--gg-panel),var(--gg-work-area));box-shadow:0 1px 4px rgba(34,67,102,.12);\}|.
+    rv_html = rv_html && |.gg-selection>form>input[type=hidden]+fieldset\{margin-top:0;\}|.
     rv_html = rv_html && |.gg-selection fieldset>legend\{padding:0 7px;color:#123b64;font-size:13px;font-weight:600;\}|.
     rv_html = rv_html && |.gg-selection-line\{display:flex;align-items:center;gap:10px;min-height:28px;padding:1px 0;\}|.
     rv_html = rv_html && |.gg-selection-line .gg-field\{display:flex;align-items:center;min-height:26px;width:auto;margin:0;padding:0;\}|.
@@ -380,7 +388,8 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-selection .gg-type-number,.gg-dynpro .gg-type-number,.gg-alv .gg-type-number\{text-align:right;\}|.
     rv_html = rv_html && |.gg-selection input[type=text],.gg-selection select\{height:var(--gg-row);padding:2px 6px;border:1px solid var(--gg-border-dark);border-radius:1px;background:var(--gg-input);color:#123b64;box-sizing:border-box;font:inherit;box-shadow:inset 0 1px 2px rgba(54,87,116,.18);\}|.
     rv_html = rv_html && |.gg-selection input[type=text]:focus,.gg-selection select:focus\{border-color:#5e8fbd;box-shadow:0 0 0 2px rgba(94,143,189,.25),inset 0 1px 2px rgba(54,87,116,.18);outline:0;\}|.
-    rv_html = rv_html && |.gg-selection input[required]\{background:#fff1a6;border-color:#d4a000;\}|.
+* Only the field holding the cursor is yellow, the way SAP GUI highlights it.
+    rv_html = rv_html && |.gg-selection input[type=text]:focus:not([readonly]),.gg-selection select:focus\{background-color:#fff1a6;\}|.
     rv_html = rv_html && |.gg-selection input:disabled,.gg-selection select:disabled\{background:#d1d1d1;color:#808080;cursor:default;\}|.
     rv_html = rv_html && |.gg-selection .gg-choice\{gap:8px;min-height:26px;padding:2px 0;\}|.
     rv_html = rv_html && |.gg-selection .gg-choice input[type=checkbox],.gg-selection .gg-choice input[type=radio]\{width:14px;height:14px;margin:0;accent-color:#28679e;\}|.
@@ -401,10 +410,7 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
 * label column that the field labels to their left occupy.
     rv_html = rv_html && |.gg-range-input\{width:auto;min-width:5rem;\}|.
     rv_html = rv_html && |.gg-range-to\{color:#315a7f;font-size:12px;\}|.
-    rv_html = rv_html && |.gg-required-marker\{display:inline-flex;align-items:center;justify-content:center;width:18px;height:18px;border:1px solid #c39400;border-radius:50%;background:#fff1a6;color:#8a5c00;font-size:12px;font-weight:700;\}|.
     rv_html = rv_html && |.gg-range-row--single\{grid-template-columns:auto 22px 22px;\}|.
-    rv_html = rv_html && |.gg-selection .gg-actions\{display:flex;justify-content:flex-start;gap:8px;margin:.75rem 0 0;padding:.75rem 0 0;border:0;border-top:1px solid #8daac4;border-radius:0;background:transparent;box-shadow:none;\}|.
-    rv_html = rv_html && |.gg-selection .gg-actions:hover\{background:transparent;box-shadow:none;\}|.
     rv_html = rv_html && |.gg-selection button:not(.gg-help-button)\{min-height:26px;padding:2px 12px;border:1px solid #8c8c8c;border-radius:2px;background:linear-gradient(#fefefe,#d9d9d9);color:#163e6b;font:inherit;cursor:pointer;box-shadow:none;\}|.
     rv_html = rv_html && |.gg-selection button:not(.gg-help-button):hover,.gg-selection button:not(.gg-help-button):focus\{background:linear-gradient(#fff,#c7dced);border-color:#5e8fbd;outline:0;\}|.
     rv_html = rv_html && |.gg-selection button:not(.gg-help-button):disabled\{background:#d1d1d1;color:#808080;cursor:default;\}|.
@@ -431,8 +437,6 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-range-to\{grid-column:2;\}|.
     rv_html = rv_html && |.gg-range-row--single .gg-range-input\{grid-column:2;\}|.
     rv_html = rv_html && |.gg-range-row .gg-help-button\{justify-self:start;\}|.
-    rv_html = rv_html && |.gg-selection .gg-actions\{flex-wrap:wrap;\}|.
-    rv_html = rv_html && |.gg-selection .gg-actions button\{flex:1 1 9rem;\}|.
     rv_html = rv_html && |\}|.
     rv_html = rv_html && |.gg-dynpro\{position:relative;min-height:12rem;overflow:hidden;background:linear-gradient(var(--gg-panel),var(--gg-work-area));box-sizing:border-box;color:#123b64;\}|.
     rv_html = rv_html && |.gg-context-menu\{position:fixed;z-index:1200;min-width:170px;padding:3px;background:#fff;border:1px solid #7594b2;box-shadow:0 4px 14px rgba(18,52,84,.28);color:#123b64;\}|.
@@ -461,7 +465,7 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
     rv_html = rv_html && |.gg-dynpro .gg-type-text,.gg-dynpro .gg-type-date,.gg-dynpro .gg-type-time\{text-align:left;\}|.
     rv_html = rv_html && |.gg-dynpro input[type=checkbox],.gg-dynpro input[type=radio]\{width:14px;height:14px;margin:0;flex:0 0 auto;accent-color:#28679e;\}|.
     rv_html = rv_html && |.gg-dynpro-control>input[type=text],.gg-dynpro-control>input[type=password]\{width:100%;\}|.
-    rv_html = rv_html && |.gg-dynpro input[required]\{background:#fff1a6;border-color:#d4a000;\}|.
+    rv_html = rv_html && |.gg-dynpro input[type=text]:focus:not([readonly]),.gg-dynpro input[type=password]:focus:not([readonly]),.gg-dynpro select:focus\{background-color:#fff1a6;\}|.
     rv_html = rv_html && |.gg-dynpro button\{min-height:26px;padding:2px 12px;border:1px solid #8c8c8c;border-radius:2px;background:linear-gradient(#fefefe,#d9d9d9);color:#163e6b;cursor:pointer;\}|.
     rv_html = rv_html && |.gg-dynpro button:hover,.gg-dynpro button:focus\{background:linear-gradient(#fff,#c7dced);border-color:#5e8fbd;outline:0;\}|.
     rv_html = rv_html && |.gg-dynpro button:disabled\{background:#d1d1d1;color:#808080;cursor:default;\}|.
@@ -538,7 +542,8 @@ CLASS zcl_gg_host_html IMPLEMENTATION.
       iv_session_id   = iv_session_id
       iv_page_id      = iv_page_id
       is_status       = is_status
-      iv_content_form = COND string( WHEN iv_kind = zif_gg_host_html_v1=>page_dynpro THEN `gg-dynpro-form` ELSE `` ) ).
+      iv_content_form = COND string( WHEN iv_kind = zif_gg_host_html_v1=>page_dynpro THEN `gg-dynpro-form` ELSE `` )
+      iv_execute_form = COND string( WHEN iv_kind = zif_gg_host_html_v1=>page_selection THEN `gg-host-form` ELSE `` ) ).
     rv_html = rv_html && |<div class="wb-runtime-content{ lv_content_class }" data-session-id="{ escape_attribute( iv_session_id ) }" data-page-id="{ escape_attribute( iv_page_id ) }" data-page-kind="{ escape_attribute( iv_kind ) }">|.
     rv_html = rv_html && |<main id="gg-main-content" aria-labelledby="wb-page-title">{ iv_body }</main></div>|.
     rv_html = rv_html && zcl_gg_workbench_utility=>render_bottom( ).

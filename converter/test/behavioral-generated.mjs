@@ -199,6 +199,26 @@ async function prepare() {
     className: "ZCL_BV_LORDER",
     transactionCode: "ZBVORDER",
   });
+  // A parameter keeps its declared type: TYPE d arithmetic crosses the month
+  // end, which a string member would turn into 20260931.
+  const typedParameterResult = await convertProgram({
+    source: [
+      "REPORT ztyped_parameter.",
+      "PARAMETERS p_date TYPE d DEFAULT '20260930'.",
+      "PARAMETERS p_count TYPE i.",
+      "INITIALIZATION.",
+      "  p_date = p_date + 1.",
+      "START-OF-SELECTION.",
+      "  WRITE / p_date.",
+      "  WRITE / p_count.",
+    ].join("\n"),
+    filename: "ztyped_parameter.prog.abap",
+    className: "ZCL_BV_PTYPED",
+    transactionCode: "ZBVPTYPED",
+  });
+  if (!typedParameterResult.classSource) throw new Error("converter produced no typed-parameter class");
+  await fs.writeFile(path.join(inputFolder, "ZCL_BV_PTYPED.clas.abap"), typedParameterResult.classSource, "utf8");
+
   if (!lifecycleOrderResult.classSource) throw new Error("converter produced no lifecycle-order class");
   await fs.writeFile(path.join(inputFolder, "ZCL_BV_LORDER.clas.abap"), lifecycleOrderResult.classSource, "utf8");
 
@@ -254,6 +274,52 @@ async function prepare() {
     throw new Error("converter produced no supported dynamic-WRITE expression class");
   }
   await fs.writeFile(path.join(inputFolder, "ZCL_BV_DWRITE_EXPR.clas.abap"), dynamicWriteExpressionResult.classSource, "utf8");
+
+  // LOOP AT SCREEN in a FORM performed from the PBO event changes the states
+  // the host displays, as SCREEN does for any procedure called during PBO.
+  const screenFormResult = await convertProgram({
+    source: await fs.readFile(path.join(repository, "converter", "test", "fixtures", "regression_screen_form.prog.abap.txt"), "utf8"),
+    filename: "zscreen_form.prog.abap",
+    className: "ZCL_BV_SFORM",
+    transactionCode: "ZBVSFORM",
+  });
+  if (!screenFormResult.classSource || !screenFormResult.supported) {
+    throw new Error("converter produced no supported screen FORM class");
+  }
+  await fs.writeFile(path.join(inputFolder, "ZCL_BV_SFORM.clas.abap"), screenFormResult.classSource, "utf8");
+
+  const dynproScreenFormResult = await convertProgram({
+    source: await fs.readFile(path.join(repository, "converter", "test", "fixtures", "regression_screen_form_dynpro.prog.abap.txt"), "utf8"),
+    filename: "zscreen_form_dynpro.prog.abap",
+    className: "ZCL_BV_DFORM",
+    transactionCode: "ZBVDFORM",
+    dynproMetadata: {
+      initialScreen: "0100",
+      screens: [{ number: "0100", title: "Form", elements: [
+        { kind: "output", name: "GV_COUNTER" },
+        { kind: "input", name: "GV_SECRET", attributes: { group1: "OFF" } },
+      ] }],
+      flowLogic: [{ screen: "0100", pbo: [{ name: "STATUS_0100" }], pai: [{ name: "USER_COMMAND_0100" }] }],
+    },
+  });
+  if (!dynproScreenFormResult.classSource || !dynproScreenFormResult.supported) {
+    throw new Error("converter produced no supported dynpro screen FORM class");
+  }
+  await fs.writeFile(path.join(inputFolder, "ZCL_BV_DFORM.clas.abap"), dynproScreenFormResult.classSource, "utf8");
+
+  // The OK-code fields come from the screen XML beside the program: 0100
+  // declares OK_CODE and 0200 declares GV_DETAIL_OK.
+  const okCodeFilename = path.join(repository, "converter", "test", "examples", "dynpro_ok_code_field", "input", "zexample_okcode.prog.abap");
+  const okCodeResult = await convertProgram({
+    source: await fs.readFile(okCodeFilename, "utf8"),
+    filename: okCodeFilename,
+    className: "ZCL_BV_OKCODE",
+    transactionCode: "ZBVOKCODE",
+  });
+  if (!okCodeResult.classSource || !okCodeResult.supported) {
+    throw new Error("converter produced no supported OK-code dynpro class");
+  }
+  await fs.writeFile(path.join(inputFolder, "ZCL_BV_OKCODE.clas.abap"), okCodeResult.classSource, "utf8");
 
   await fs.writeFile(configPath, JSON.stringify({
     input_folder: ["src", "framework", "examples", "converter/behavior-validation/input"],
@@ -444,6 +510,14 @@ try {
     rs_result: 1,
   }));
   assert.deepEqual(lifecycleOrder.lines, ["load", "init", "start", "end"]);
+  const typedParameter = normalize(await zcl_gg_host.run({
+    io_report: new abap.Classes.ZCL_BV_PTYPED(),
+    rs_result: 1,
+  }));
+  // The changed date goes back to the screen in YYYYMMDD form; the untouched
+  // integer keeps its empty input instead of becoming "0 ".
+  assert.deepEqual(typedParameter.values.map((item) => [item.name, item.value]), [["P_COUNT", ""], ["P_DATE", "20261001"]]);
+  assert.deepEqual(typedParameter.lines, ["20261001", "0"]);
   const terminal = normalize(await zcl_gg_host.run({
     io_report: new abap.Classes.ZCL_BV_TERMINAL(),
     rs_result: 1,
@@ -461,6 +535,47 @@ try {
     rs_result: 1,
   }));
   assert.deepEqual(dynamicWriteExpression.lines, ["expression"]);
+
+  // The FORM makes P_OTHER obligatory, so the run needs a value for it.
+  const screenForm = normalize(await zcl_gg_host.run({
+    io_report: new abap.Classes.ZCL_BV_SFORM(),
+    rs_result: 1,
+    it_input: inputValues([["P_OTHER", "X"]], zcl_gg_host),
+  }));
+  const screenState = (states, name) => states.find((item) => item.name.trim() === name);
+  assert.equal(screenState(screenForm.states, "P_TEXT").visible, abap.builtin.abap_false.get());
+  assert.equal(screenState(screenForm.states, "P_OTHER").visible, abap.builtin.abap_true.get());
+  assert.equal(screenState(screenForm.states, "P_OTHER").obligatory, abap.builtin.abap_true.get());
+  assert.deepEqual(screenForm.lines, ["done"]);
+
+  const dynproScreenForm = plain(await zcl_gg_host_dynpro.run({
+    io_program: new abap.Classes.ZCL_BV_DFORM(),
+  }));
+  assert.equal(screenState(dynproScreenForm.states, "GV_SECRET").visible, abap.builtin.abap_false.get());
+  assert.equal(screenState(dynproScreenForm.states, "GV_COUNTER").visible, abap.builtin.abap_true.get());
+
+  // Each command reaches the PAI branch that reads the screen's own OK-code
+  // field, so the generated CASE decides, not a fixed GV_OK_CODE.
+  const okCode = async (screen, ucomm) => plain(await zcl_gg_host_dynpro.run({
+    io_program: new abap.Classes.ZCL_BV_OKCODE(),
+    iv_screen: screen,
+    iv_ucomm: ucomm,
+  }));
+  const okCodeValue = (result, name) => result.values.find((item) => item.name.trim() === name)?.value.trim();
+  const leftProgram = (result) => result.terminal_state === abap.builtin.abap_true.get();
+  assert.equal(leftProgram(await okCode("0100", "BACK")), true, "BACK on 0100 did not reach LEAVE PROGRAM");
+  const overviewExit = await okCode("0100", "EXIT");
+  assert.equal(overviewExit.screen, "0200");
+  assert.equal(leftProgram(overviewExit), false);
+  const overviewCancel = await okCode("0100", "CANC");
+  assert.equal(okCodeValue(overviewCancel, "GV_LAST"), "CANCELED");
+  assert.equal(okCodeValue(overviewCancel, "OK_CODE"), "", "the PAI module clears OK_CODE after reading it");
+  assert.equal(leftProgram(overviewCancel), false);
+  assert.equal((await okCode("0200", "BACK")).screen, "0100");
+  assert.equal(leftProgram(await okCode("0200", "EXIT")), true, "EXIT on 0200 did not reach LEAVE PROGRAM");
+  const detailCancel = await okCode("0200", "CANC");
+  assert.equal(okCodeValue(detailCancel, "GV_LAST"), "DETAIL CANCELED");
+  assert.equal(okCodeValue(detailCancel, "OK_CODE"), "", "screen 0200 wrote the OK-code field of screen 0100");
 
   const dbSystem = abap.builtin.sy.get().dbsys;
   const previousDbSystem = dbSystem.get();

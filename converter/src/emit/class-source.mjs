@@ -1,6 +1,11 @@
 import { CONVERTER_VERSION, MANIFEST_SCHEMA_VERSION } from "../options.mjs";
 import { controlObjectTypes, lowerStatements, selectionExpression, selectionType } from "../passes/lower-statements.mjs";
+import { dynproStatesSetter, routineScreenStates, screenStateMembers, screenStatePlan, selectionStatesSetter, storedScreenStates } from "../passes/screen-states.mjs";
 import { scaffoldIR } from "../ir/scaffold-ir.mjs";
+import { hasProgramMetadata } from "../passes/select-interfaces.mjs";
+import { BLOCK_BRANCHES, BLOCK_ENDS, BLOCK_OPENERS, closesBlock } from "../passes/blocks.mjs";
+import { isSuspendingStatement } from "../passes/lower-continuations.mjs";
+import { screenOkCode } from "../dynpro-metadata.mjs";
 
 const REPORT_METHODS = [
   "load_of_program", "get_logical_database", "get_list_processing", "build_screen", "initialization",
@@ -175,8 +180,16 @@ export function prepareLocalClassNames(ir, options = {}) {
   return renames;
 }
 
+// A cx_root handler that named no target is given this one, so it can pass
+// the host's control-flow unwinding on; one declaration serves the method.
+function withControlFlowGuard(body) {
+  const lines = body.flatMap((line) => String(line).split("\n"));
+  if (!lines.some((line) => /\bINTO\s+lx_ggconv_caught\./i.test(line))) return body;
+  return ["DATA lx_ggconv_caught TYPE REF TO cx_root.", ...body];
+}
+
 function method(name, body, comment) {
-  const entry = { name, body: body.length ? [...body] : ["RETURN."] };
+  const entry = { name, body: body.length ? withControlFlowGuard([...body]) : ["RETURN."] };
   if (comment) entry.comment = comment;
   Object.defineProperty(entry, "toString", {
     enumerable: false,
@@ -209,8 +222,22 @@ function addWriterDeclaration(body) {
   return [...fields, ...data, declaration, ...rest];
 }
 
+// The program in the transaction metadata lets SUBMIT find the class through
+// the transaction registry, whatever the class is called.
+function programField(ir) {
+  return ir.programName ? ` program = '${ir.programName}'` : "";
+}
+
+// A report no transaction starts declares its program instead, which lists it
+// in the workbench and lets SUBMIT find it through the program registry.
+function programMethod(ir, description = ir.description) {
+  return method("zif_gg_program_v1~get_program", [
+    `rs_program = VALUE #( program = ${literal(ir.programName)} description = ${literal(description)} ).`,
+  ]);
+}
+
 function interfaceOrder(ir) {
-  const order = ["zif_gg_report_v1", "zif_gg_screen_provider_v1", "zif_gg_dynpro_v1", "zif_gg_context_menu_v1", "zif_gg_transaction_v1", "zif_gg_list_processing_v1", "zif_gg_resumable_v1"];
+  const order = ["zif_gg_report_v1", "zif_gg_screen_provider_v1", "zif_gg_dynpro_v1", "zif_gg_context_menu_v1", "zif_gg_transaction_v1", "zif_gg_program_v1", "zif_gg_list_processing_v1", "zif_gg_resumable_v1"];
   return order.filter((name) => ir.interfaces.includes(name));
 }
 
@@ -247,14 +274,81 @@ function implicitSelectionLayoutMembers(ir) {
   return [...names].sort();
 }
 
+const LENGTH_TYPES = new Set(["c", "n", "x", "p"]);
+
+// The member holding a PARAMETERS value gets the type the parameter declares, so
+// arithmetic, formatting and typed method calls behave as in the report. The
+// screen transports values as strings; assignment converts in both directions.
+// Types are assumed to exist, as for DATA declarations.
+// The class member standing for a report data object: another parameter or
+// select-option, or a report global, possibly renamed. Undefined when the name
+// is not one, e.g. a dictionary structure in LIKE mara-matnr.
+function reportMember(ir, base) {
+  const tables = (ir.declarations ?? []).find((item) => item.kind === "tables" && item.names?.includes(base));
+  if (tables && !tables.resolved) return undefined;
+  return ir.statePlan?.selectionState?.[base]?.member
+    ?? ir.statePlan?.renames?.[base]?.toLowerCase()
+    ?? (ir.statePlan?.globals?.includes(base)
+      || (ir.declarations ?? []).some((item) => item.kind === "constant" && item.statement?.scope !== "local" && item.names?.includes(base))
+      ? base.toLowerCase() : undefined);
+}
+
+// SELECT-OPTIONS and RANGES ... FOR target get a range table of the target's
+// type, so LOW and HIGH compare, convert and pass to typed parameters as in the
+// report. A dynamic FOR (name) has no static type; its LOW and HIGH are strings,
+// as the screen transports them. Inside a chain the target still carries the
+// comma that separates it from the next element.
+function rangeType(ir, target, member = (base) => reportMember(ir, base)) {
+  const match = /^([A-Z][A-Z0-9_\/]*)((?:-[A-Z][A-Z0-9_]*)*)$/i.exec(String(target ?? "").trim().replace(/\s*[,.]$/, ""));
+  if (!match) return "TYPE RANGE OF string";
+  const resolved = member(match[1].toUpperCase());
+  return resolved
+    ? `LIKE RANGE OF ${resolved}${match[2].toLowerCase()}`
+    : `TYPE RANGE OF ${`${match[1]}${match[2]}`.toLowerCase()}`;
+}
+
+function selectOptionTarget(additions) {
+  return /^\s*FOR\s+([^\s]+)/i.exec(String(additions ?? ""))?.[1];
+}
+
 function selectionStateType(ir, state) {
-  if (state.ranges) return "zif_gg_selection_screen_types=>ty_ranges";
-  const typeName = state.dataType?.typ?.toLowerCase();
-  if (!typeName) return "string";
-  const localType = (ir.declarations ?? []).some((item) => item.kind === "type"
-    && item.names?.some((name) => name.toLowerCase() === typeName));
-  if (localType) return typeName;
-  return "string";
+  if (state.ranges) return rangeType(ir, selectOptionTarget(state.additions));
+  const additions = String(state.additions ?? "").replace(/'(?:''|[^'])*'|`(?:``|[^`])*`/g, "''").replace(/,\s*$/, "");
+  const oldLength = /^\(\s*(\d+)\s*\)/.exec(additions)?.[1];
+  const type = /\bTYPE\s+([A-Z][A-Z0-9_\/]*(?:-[A-Z][A-Z0-9_]*)*)(?:\s+LENGTH\s+(\d+))?(?:\s+DECIMALS\s+(\d+))?/i.exec(additions);
+  if (type) {
+    const name = type[1].toLowerCase();
+    if (!LENGTH_TYPES.has(name)) return `TYPE ${name}`;
+    const length = type[2] ?? oldLength;
+    return `TYPE ${name}${length ? ` LENGTH ${length}` : ""}${type[3] ? ` DECIMALS ${type[3]}` : ""}`;
+  }
+  const like = /\bLIKE\s+([A-Z][A-Z0-9_\/]*)((?:-[A-Z][A-Z0-9_]*)*)/i.exec(additions);
+  if (like) {
+    const member = reportMember(ir, like[1].toUpperCase());
+    return member ? `LIKE ${member}${like[2].toLowerCase()}` : `TYPE ${`${like[1]}${like[2]}`.toLowerCase()}`;
+  }
+  // PARAMETERS without a type is c of length 8; a checkbox or radio button is c of length 1.
+  if (/\b(?:AS\s+CHECKBOX|RADIOBUTTON\s+GROUP)\b/i.test(additions)) return "TYPE c LENGTH 1";
+  return `TYPE c LENGTH ${oldLength ?? 8}`;
+}
+
+// Re-emits a BEGIN OF ... END OF structure as one chain. INCLUDE TYPE and
+// INCLUDE STRUCTURE are statements of their own, so they break the chain.
+function structuredDeclaration(keyword, beginName, components, endName) {
+  const statements = [];
+  let chain = [`BEGIN OF ${beginName}`];
+  for (const component of components) {
+    if (/^INCLUDE\s+(?:TYPE|STRUCTURE)\b/i.test(component)) {
+      if (chain.length) statements.push(`${keyword}: ${chain.join(", ")}.`);
+      statements.push(`${component}.`);
+      chain = [];
+    } else {
+      chain.push(component);
+    }
+  }
+  chain.push(`END OF ${endName}`);
+  statements.push(`${keyword}: ${chain.join(", ")}.`);
+  return statements.join(" ");
 }
 
 function dataMembers(ir) {
@@ -274,12 +368,16 @@ function dataMembers(ir) {
     const components = [];
     for (let cursor = index + 1; cursor < declarations.length; cursor++) {
       consumed.add(cursor);
-      if (declarations[cursor].kind === begin) {
-        components.push(rename(declarations[cursor].raw.replace(new RegExp(`^${keyword}\\s+`, "i"), "")));
+      if (declarations[cursor].kind === begin || declarations[cursor].kind === "includetype") {
+        // A component ends in "," inside a chain and in "." where the chain was
+        // broken, e.g. before INCLUDE TYPE; the structure is re-emitted as one
+        // chain, so the terminator is replaced by a comma.
+        const component = declarations[cursor].raw.replace(new RegExp(`^${keyword}\\s+`, "i"), "").replace(/\s*[,.]\s*$/, "");
+        if (component) components.push(rename(component));
       }
       if (declarations[cursor].kind === end) {
         const endName = /END OF\s+([A-Z0-9_]+)/i.exec(declarations[cursor].raw)?.[1] ?? target;
-        const declaration = `${keyword}: BEGIN OF ${target}, ${components.join(" ")} END OF ${endName}.`;
+        const declaration = structuredDeclaration(keyword, target, components, endName);
         (keyword === "TYPES" ? typeMembers : dataMembers).push(rename(declaration));
         break;
       }
@@ -289,10 +387,8 @@ function dataMembers(ir) {
   const rangeMember = (item) => {
     const name = item.names?.[0]?.toLowerCase();
     if (!name) return undefined;
-    // RANGES creates a four-column selection range table. The scaffold's
-    // shared range type is the legal class-pool equivalent and keeps LOW/HIGH
-    // transport stable even when the original DDIC type is not available.
-    return `DATA ${name} TYPE zif_gg_selection_screen_types=>ty_ranges.`;
+    // RANGES creates a four-column selection range table of the FOR target.
+    return `DATA ${name} ${rangeType(ir, item.target)}.`;
   };
   for (let index = 0; index < declarations.length; index++) {
     const item = declarations[index];
@@ -362,7 +458,7 @@ function dataMembers(ir) {
       `TYPES ${ir.dynamicAlv.tableType} TYPE STANDARD TABLE OF ${ir.dynamicAlv.rowType} WITH EMPTY KEY.`,
     ]
     : [];
-  const members = [...typeMembers, ...dynamicTypes, ...constantMembers, ...dataMembers];
+  const members = [...typeMembers, ...dynamicTypes, ...constantMembers, ...dataMembers, ...screenStateMembers(ir)];
   if (ir.dynamicAlv) members.push(`DATA ${ir.dynamicAlv.tableMember.toLowerCase()} TYPE ${ir.dynamicAlv.tableType}.`);
   for (const statement of ir.statements ?? []) {
     if (statement.kind !== "Controls") continue;
@@ -371,10 +467,19 @@ function dataMembers(ir) {
     const type = controls[2].toUpperCase() === "TABSTRIP" ? "ty_tabstrip_runtime" : "ty_table_runtime";
     members.push(`DATA ${controls[1].toLowerCase()} TYPE zif_gg_dynpro_types_v1=>${type}.`);
   }
-  for (const [name, state] of Object.entries(ir.statePlan?.selectionState ?? {})) {
-    const type = selectionStateType(ir, state);
-    members.push(`DATA ${state.member} TYPE ${type}.`);
-  }
+  // `LIKE` can only name an attribute declared earlier, so a parameter declared
+  // LIKE another parameter comes after it.
+  const selectionState = ir.statePlan?.selectionState ?? {};
+  const emitted = new Set();
+  const emitSelection = (name) => {
+    if (emitted.has(name)) return;
+    emitted.add(name);
+    const state = selectionState[name];
+    const like = /\b(?:LIKE|FOR)\s+([A-Z][A-Z0-9_\/]*)/i.exec(String(state.additions ?? ""))?.[1]?.toUpperCase();
+    if (like && selectionState[like]) emitSelection(like);
+    members.push(`DATA ${state.member} ${selectionStateType(ir, state)}.`);
+  };
+  Object.keys(selectionState).forEach(emitSelection);
   for (const routine of ir.routines) {
     const parameters = routine.parameters ?? [];
     const parameterType = (parameter) => {
@@ -445,6 +550,17 @@ function staticSelectionText(ir, token) {
   return values.get(key) ?? token;
 }
 
+// A text-pool entry of "." marks a selection text with dictionary reference:
+// SAP shows the field label of the data element the field is typed with. The
+// label is read at runtime from the member holding the field's value.
+function selectionText(ir, item) {
+  const member = ir.statePlan?.selectionState?.[item.name?.toUpperCase()]?.member;
+  if (member && /^(?:D\s+)?\.$/.test(String(item.text ?? "").trim())) {
+    return `io_builder->get_ddic_text( ig_field = ${member} iv_name = '${item.name}' )`;
+  }
+  return literal(item.text ?? item.name);
+}
+
 function hasSelectionValueRequest(ir, name) {
   const target = String(name ?? "").toUpperCase();
   if (!target) return false;
@@ -462,6 +578,14 @@ function selectionBuilder(ir) {
   for (const screen of ir.selections) {
     if (screen.number !== "0100" || screen.asWindow || screen.asSubscreen) {
       lines.push(`io_builder->begin_screen( VALUE #( number = '${screen.number}'${screen.asWindow ? " as_window = abap_true" : ""}${screen.asSubscreen ? " as_subscreen = abap_true" : ""} ) ).`);
+    }
+    // USER-COMMAND is written on one button of a radio group, usually the
+    // first, and belongs to the whole group: selecting any button raises it.
+    const groupCommands = new Map();
+    for (const item of screen.elements) {
+      const group = item.kind === "parameter" ? /RADIOBUTTON\s+GROUP\s+(\w+)/i.exec(item.additions ?? "")?.[1]?.toUpperCase() : undefined;
+      const ucomm = group ? /USER-COMMAND\s+(\w+)/i.exec(item.additions ?? "")?.[1] : undefined;
+      if (ucomm && !groupCommands.has(group)) groupCommands.set(group, ucomm.toUpperCase());
     }
     for (const item of screen.elements) {
       if (item.kind === "layout") {
@@ -490,28 +614,31 @@ function selectionBuilder(ir) {
         if (/AS\s+CHECKBOX/i.test(additions)) {
           const ucomm = /USER-COMMAND\s+(\w+)/i.exec(additions)?.[1];
           const modif = /MODIF\s+ID\s+(\w+)/i.exec(additions)?.[1];
-          const fields = [`name = '${item.name}'`, `text = ${literal(item.text ?? item.name)}`];
+          const fields = [`name = '${item.name}'`, `text = ${selectionText(ir, item)}`];
           if (/DEFAULT\s+(?:['"]?X|ABAP_TRUE)\b/i.test(additions)) fields.push("default = abap_true");
           if (modif) fields.push(`modif_id = '${modif.toUpperCase()}'`);
           if (ucomm) fields.push(`ucomm = '${ucomm.toUpperCase()}'`);
           lines.push(`io_builder->add_checkbox( VALUE #( ${fields.join(" ")} ) ).`);
         } else if (/RADIOBUTTON\s+GROUP\s+(\w+)/i.test(additions)) {
           const group = /RADIOBUTTON\s+GROUP\s+(\w+)/i.exec(additions)[1].toUpperCase();
-          const ucomm = /USER-COMMAND\s+(\w+)/i.exec(additions)?.[1];
+          const ucomm = groupCommands.get(group);
+          const modif = /MODIF\s+ID\s+(\w+)/i.exec(additions)?.[1];
           const defaultValue = /DEFAULT\s+(?:['"]?X|ABAP_TRUE)\b/i.test(additions) ? " default = abap_true" : "";
-          lines.push(`io_builder->add_radiobutton( VALUE #( name = '${item.name}' text = ${literal(item.text ?? item.name)} radio_group = '${group}'${defaultValue}${ucomm ? ` ucomm = '${ucomm.toUpperCase()}'` : ""} ) ).`);
+          lines.push(`io_builder->add_radiobutton( VALUE #( name = '${item.name}' text = ${selectionText(ir, item)} radio_group = '${group}'${defaultValue}${modif ? ` modif_id = '${modif.toUpperCase()}'` : ""}${ucomm ? ` ucomm = '${ucomm}'` : ""} ) ).`);
         } else if (/AS\s+LISTBOX/i.test(additions)) {
-          const fields = [`name = '${item.name}'`, `text = ${literal(item.text ?? item.name)}`, type];
+          const fields = [`name = '${item.name}'`, `text = ${selectionText(ir, item)}`, type];
           const visibleLength = /VISIBLE\s+LENGTH\s+(\d+)/i.exec(additions)?.[1];
           if (visibleLength) fields[2] = type.replace(/\s\)$/, ` visible_length = ${visibleLength} )`);
           const defaultValue = selectionDefault(item);
           if (defaultValue) fields.push(`default = ${defaultValue}`);
+          const modif = /MODIF\s+ID\s+(\w+)/i.exec(additions)?.[1];
+          if (modif) fields.push(`modif_id = '${modif.toUpperCase()}'`);
           const ucomm = /USER-COMMAND\s+(\w+)/i.exec(additions)?.[1];
           if (ucomm) fields.push(`ucomm = '${ucomm.toUpperCase()}'`);
           if (item.fixedValues?.length) fields.push(`fixed_values = VALUE #( ${item.fixedValues.map((fixed) => `( key = ${literal(fixed.key ?? fixed.value ?? "")} text = ${literal(fixed.text ?? fixed.label ?? fixed.key ?? "")} )`).join(" ")} )`);
           lines.push(`io_builder->add_listbox( VALUE #( ${fields.join(" ")} ) ).`);
         } else {
-          const fields = [`name = '${item.name}'`, `text = ${literal(item.text ?? item.name)}`, type];
+          const fields = [`name = '${item.name}'`, `text = ${selectionText(ir, item)}`, type];
           const defaultValue = selectionDefault(item);
           if (defaultValue) fields.push(`default = ${defaultValue}`);
           const modif = /MODIF\s+ID\s+(\w+)/i.exec(additions)?.[1];
@@ -527,13 +654,22 @@ function selectionBuilder(ir) {
           lines.push(`io_builder->add_parameter( VALUE #( ${fields.join(" ")} ) ).`);
         }
       } else if (item.kind === "select-option") {
-        const fields = [`name = '${item.name}'`, `text = ${literal(item.text ?? item.name)}`, `data_type = ${selectionDataType(item)}`];
+        const fields = [`name = '${item.name}'`, `text = ${selectionText(ir, item)}`, `data_type = ${selectionDataType(item)}`];
         if (/NO[\s-]+EXTENSION/i.test(item.additions)) fields.push("no_extension = abap_true");
         if (/NO[\s-]+INTERVALS/i.test(item.additions)) fields.push("no_intervals = abap_true");
         if (hasSelectionValueRequest(ir, item.name)) fields.push("value_help = abap_true");
         if (/OBLIGATORY/i.test(item.additions)) fields.push("obligatory = abap_true");
         const defaultMatch = /DEFAULT\s+([^\s,]+)(?:\s+TO\s+([^\s,]+))?/i.exec(item.additions);
         if (defaultMatch) fields.push(`default = VALUE #( sign = 'I' option = '${defaultMatch[2] ? "BT" : "EQ"}' low = ${selectionExpression(defaultMatch[1])}${defaultMatch[2] ? ` high = ${selectionExpression(defaultMatch[2])}` : ""} )`);
+        const modif = /MODIF\s+ID\s+(\w+)/i.exec(item.additions ?? "")?.[1];
+        if (modif) fields.push(`modif_id = '${modif.toUpperCase()}'`);
+        const memoryId = /MEMORY\s+ID\s+(\w+)/i.exec(item.additions ?? "")?.[1];
+        if (memoryId) fields.push(`memory_id = '${memoryId.toUpperCase()}'`);
+        const searchHelp = /MATCHCODE\s+OBJECT\s+(\w+)/i.exec(item.additions ?? "")?.[1];
+        if (searchHelp) fields.push(`search_help = '${searchHelp.toUpperCase()}'`);
+        if (searchHelp && !fields.includes("value_help = abap_true")) fields.push("value_help = abap_true");
+        if (/LOWER\s+CASE/i.test(item.additions ?? "")) fields.push("lower_case = abap_true");
+        if (/NO-DISPLAY/i.test(item.additions ?? "")) fields.push("no_display = abap_true");
         lines.push(`io_builder->add_select_option( VALUE #( ${fields.join(" ")} ) ).`);
       }
     }
@@ -620,13 +756,18 @@ function methodContext(ir, event, qualifierOverride, {parameters = [], statement
     localClassStaticMethods: Object.fromEntries((ir.localClasses ?? []).map((localClass) => [
       String(localClass.name ?? "").toUpperCase(),
       new Set((localClass.definition ?? [])
-        .filter((statement) => /^\s*CLASS-METHODS\b/i.test(statement.text ?? ""))
+        .filter((statement) => /^\s*CLASS-METHODS\b/i.test(statement.text ?? "") && !isStaticEventHandler(statement.text))
         .map((statement) => /^\s*CLASS-METHODS\s+([A-Z][A-Z0-9_]*)\b/i.exec(statement.text)?.[1]?.toUpperCase())
         .filter(Boolean)),
+    ])),
+    localClassStaticEventHandlers: Object.fromEntries((ir.localClasses ?? []).map((localClass) => [
+      String(localClass.name ?? "").toUpperCase(),
+      staticEventHandlerNames(localClass),
     ])),
     localClassStaticParameters: Object.fromEntries((ir.localClasses ?? []).map((localClass) => [
       String(localClass.name ?? "").toUpperCase(),
       Object.fromEntries((localClass.definition ?? [])
+        .filter((statement) => !isStaticEventHandler(statement.text))
         .map((statement) => {
           const match = /^\s*CLASS-METHODS\s+([A-Z][A-Z0-9_]*)\b([\s\S]*)$/i.exec(statement.text ?? "");
           if (!match) return undefined;
@@ -648,7 +789,13 @@ function methodContext(ir, event, qualifierOverride, {parameters = [], statement
     dynamicAlv: ir.dynamicAlv,
     rangeDeclarations: Object.fromEntries((ir.declarations ?? [])
       .filter((declaration) => declaration.kind === "ranges")
-      .flatMap((declaration) => (declaration.names ?? []).map((name) => [name.toUpperCase(), "zif_gg_selection_screen_types=>ty_ranges"]))),
+      .flatMap((declaration) => (declaration.names ?? []).map((name) => [name.toUpperCase(), rangeType(ir, declaration.target, (base) => {
+        // A RANGES in a FORM may be FOR the FORM's own variables and parameters.
+        const local = declaration.statement?.scope === "local"
+          && ((ir.declarations ?? []).some((item) => item.statement?.scope === "local" && item.names?.includes(base))
+            || (ir.routines ?? []).some((routine) => (routine.parameters ?? []).some((parameter) => parameter.name.toUpperCase() === base)));
+        return local ? base.toLowerCase() : reportMember(ir, base);
+      })]))),
     sessionVariable: "io_session",
     ownerPrefix: "",
     localClassOwner: "me",
@@ -680,8 +827,32 @@ function selectionStateTransport(ir, event) {
   const hydrate = [];
   const flush = [];
   for (const [name, item] of Object.entries(state)) {
-    hydrate.push(`${item.member} = ${source}[ name = '${name}' ]-${item.ranges ? "ranges" : "value"}.`);
-    if (source === "ct_values") flush.push(`${source}[ name = '${name}' ]-${item.ranges ? "ranges" : "value"} = ${item.member}.`);
+    const field = `${source}[ name = '${name}' ]-${item.ranges ? "ranges" : "value"}`;
+    // A select-option member is a range table of its own type; the screen
+    // transports LOW and HIGH as strings, CORRESPONDING converts each row.
+    hydrate.push(item.ranges ? `${item.member} = CORRESPONDING #( ${field} ).` : `${item.member} = ${field}.`);
+    if (source !== "ct_values") continue;
+    if (item.ranges) {
+      // As for parameters below, an untouched empty LOW of type i must not
+      // come back as "0", so the screen rows are only replaced on a change.
+      const screen = `lt_ggconv_${name.toLowerCase()}`;
+      flush.push([
+        `DATA(${screen}) = ${item.member}.`,
+        `${screen} = CORRESPONDING #( ${field} ).`,
+        `IF ${screen} <> ${item.member}.`,
+        `${field} = CORRESPONDING #( ${item.member} ).`,
+        "ENDIF.",
+      ].join("\n"));
+      continue;
+    }
+    // The member has the parameter's own type. Assigning it back would turn an
+    // untouched 1 into "1 ", -1 into "1-" and "" into "0 ", so the screen value
+    // is only replaced when the program changed it, in template format.
+    flush.push([
+      `IF ${field} <> ${item.member}.`,
+      `${field} = |{ ${item.member} }|.`,
+      "ENDIF.",
+    ].join("\n"));
   }
   return { hydrate, flush };
 }
@@ -702,24 +873,12 @@ function nestedSelectionCaptures(ir) {
       lines.push(`IF iv_screen = '${current}'.`);
     }
     const ranges = ir.statePlan?.selectionState?.[field.name]?.ranges ?? field.ranges;
-    lines.push(`mv_${field.name.toLowerCase()} = ct_values[ name = '${field.name}' ]-${ranges ? "ranges" : "value"}.`);
+    lines.push(ranges
+      ? `mv_${field.name.toLowerCase()} = CORRESPONDING #( ct_values[ name = '${field.name}' ]-ranges ).`
+      : `mv_${field.name.toLowerCase()} = ct_values[ name = '${field.name}' ]-value.`);
   }
   if (current) lines.push("ENDIF.");
   return lines;
-}
-
-const CONTROL_CLOSERS = new Map([
-  ["If", "ENDIF."],
-  ["Do", "ENDDO."],
-  ["Loop", "ENDLOOP."],
-  ["Case", "ENDCASE."],
-  ["Try", "ENDTRY."],
-  ["While", "ENDWHILE."],
-]);
-
-function isSuspendingStatement(statement) {
-  if (["CallScreen", "CallSelectionScreen", "CallTransaction"].includes(statement.kind)) return true;
-  return statement.kind === "Submit" && /\bAND\s+RETURN\b/i.test(statement.text);
 }
 
 function continuationFor(ir, statement) {
@@ -735,68 +894,77 @@ function removePromotedDeclarations(ir, lines) {
     .filter((line) => ![...promoted].some((name) => new RegExp(`^\\s*DATA\\s+${name}\\b`, 'i').test(line)));
 }
 
-function continuationClosers(continuation) {
-  return [...(continuation?.controlStack ?? [])]
-    .reverse()
-    .map((item) => CONTROL_CLOSERS.get(item.kind))
-    .filter(Boolean);
-}
-
-function isBranchStatement(statement) {
-  return ["Else", "ElseIf", "When", "WhenOthers", "Catch", "Cleanup"].includes(statement.kind);
-}
-
-function openerForCloser(kind) {
-  for (const [opener, closer] of [["If", "EndIf"], ["Do", "EndDo"], ["Loop", "EndLoop"], ["Case", "EndCase"], ["Try", "EndTry"], ["While", "EndWhile"]]) {
-    if (closer === kind) return opener;
+// The blocks open at statements[index], outermost first, with the branch of
+// each that the statement is in.
+function enclosingBlocks(statements, index) {
+  const stack = [];
+  for (let cursor = 0; cursor < index; cursor++) {
+    const statement = statements[cursor];
+    if (BLOCK_OPENERS.has(statement.kind)) {
+      stack.push({ kind: statement.kind, statement, branch: "body" });
+    } else if (BLOCK_BRANCHES.has(statement.kind) && stack.length) {
+      stack.at(-1).branch = statement.kind;
+    } else if (BLOCK_ENDS.has(statement.kind)) {
+      const open = stack.findLastIndex((item) => closesBlock(item.kind, statement.kind));
+      if (open >= 0) stack.splice(open);
+    }
   }
-  return undefined;
+  return stack;
 }
 
-// A continuation resumes after the host has unwound the original ABAP call
-// stack. Conditional blocks therefore need a small amount of structural
-// normalization: close tokens belonging to the pre-suspension path are
-// removed, and sibling ELSE/WHEN branches are skipped. New control-flow that
-// starts after the suspension remains ordinary ABAP and is preserved.
-function resumeTail(statements, index, continuation) {
-  const runtimeStack = (continuation?.controlStack ?? []).map((item) => ({ ...item, original: true }));
-  const output = [];
-  let skipped;
+// What runs after a suspension returns, as statements of the owning block.
+// Suspending unwinds the ABAP call stack, so the continuation is the rest of
+// the block the suspension is in, then the rest of each enclosing block,
+// outward. Sibling ELSE/WHEN/CATCH branches of an enclosing block are not on
+// that path and are skipped with the block's closer, except for a TRY whose
+// protected body is resumed: that TRY is opened again, so its CATCH and
+// CLEANUP branches still handle the rest of the body. Blocks that start after
+// the suspension are ordinary ABAP and are kept as written.
+function resumeTail(statements, index) {
+  const frames = enclosingBlocks(statements, index)
+    .map((frame) => ({ ...frame, reopened: frame.kind === "Try" && frame.branch === "body" }));
+  const output = frames.filter((frame) => frame.reopened).map((frame) => frame.statement);
+  let nested = 0;
+  let skipping = false;
   let skippedDepth = 0;
   for (let cursor = index + 1; cursor < statements.length; cursor++) {
     const statement = statements[cursor];
     const kind = statement.kind;
-    if (skipped) {
-      if (runtimeStack.length && ["If", "Do", "Loop", "Case", "Try", "While"].includes(kind)) skippedDepth++;
-      const closer = openerForCloser(kind);
-      if (closer) {
+    if (skipping) {
+      if (BLOCK_OPENERS.has(kind)) skippedDepth++;
+      else if (BLOCK_ENDS.has(kind)) {
         if (skippedDepth > 0) skippedDepth--;
-        else if (closer === skipped.kind) {
-          runtimeStack.pop();
-          skipped = undefined;
+        else {
+          frames.pop();
+          skipping = false;
         }
       }
       continue;
     }
-
-    if (isBranchStatement(statement) && runtimeStack.at(-1)?.original) {
-      skipped = runtimeStack.at(-1);
-      skippedDepth = 0;
-      continue;
-    }
-    const closer = openerForCloser(kind);
-    if (closer && runtimeStack.at(-1)?.original && runtimeStack.at(-1).kind === closer) {
-      runtimeStack.pop();
-      continue;
-    }
-    if (["If", "Do", "Loop", "Case", "Try", "While"].includes(kind)) {
-      runtimeStack.push({ kind, original: false });
+    if (nested > 0) {
+      if (BLOCK_OPENERS.has(kind)) nested++;
+      else if (BLOCK_ENDS.has(kind)) nested--;
       output.push(statement);
       continue;
     }
-    if (closer && runtimeStack.at(-1)?.original === false && runtimeStack.at(-1).kind === closer) {
-      runtimeStack.pop();
+    if (BLOCK_OPENERS.has(kind)) {
+      nested++;
       output.push(statement);
+      continue;
+    }
+    const frame = frames.at(-1);
+    if (BLOCK_ENDS.has(kind)) {
+      if (!frame) continue;
+      frames.pop();
+      if (frame.reopened) output.push(statement);
+      continue;
+    }
+    if (BLOCK_BRANCHES.has(kind) && frame) {
+      if (frame.reopened) output.push(statement);
+      else {
+        skipping = true;
+        skippedDepth = 0;
+      }
       continue;
     }
     output.push(statement);
@@ -804,54 +972,42 @@ function resumeTail(statements, index, continuation) {
   return output;
 }
 
-function suspensionIndex(statements) {
-  return statements.findIndex((statement) => isSuspendingStatement(statement));
-}
-
-function terminalIndex(statements) {
-  let depth = 0;
-  for (let index = 0; index < statements.length; index++) {
-    const statement = statements[index];
-    if (["If", "Do", "Loop", "Case", "Try", "While"].includes(statement.kind)) depth++;
-    if (["EndIf", "EndDo", "EndLoop", "EndCase", "EndTry", "EndWhile"].includes(statement.kind)) depth = Math.max(0, depth - 1);
-    if (isTerminal(statement) && depth === 0) return index;
-  }
-  return -1;
-}
-
 function isTerminal(statement) {
   return statement.kind === "Stop" || statement.kind === "Submit" && !/\bAND\s+RETURN\b/i.test(statement.text)
     || statement.kind === "Leave" && /\b(LEAVE\s+PROGRAM|LEAVE\s+TO\s+TRANSACTION|LEAVE\s+LIST-PROCESSING)\b/i.test(statement.text);
 }
 
+// Terminal statements and suspensions do not fall through: the session
+// unwinds the method at them. The rest of the block they are in is therefore
+// unreachable and is left out, and a suspension's rest runs from its
+// continuation instead. The block's closer, its sibling branches and
+// everything after it are still reachable and are kept.
 function truncateTerminalPaths(statements) {
   const output = [];
   let depth = 0;
-  let skipping = false;
-  let branchDepth = 0;
+  let skipDepth;
   for (const statement of statements) {
-    const opens = ["If", "Do", "Loop", "Case", "Try", "While"].includes(statement.kind);
-    const closes = ["EndIf", "EndDo", "EndLoop", "EndCase", "EndTry", "EndWhile"].includes(statement.kind);
-    const branch = ["Else", "When", "WhenOthers"].includes(statement.kind);
-    if (skipping) {
-      if (opens) depth++;
-      if (closes) {
+    const kind = statement.kind;
+    if (skipDepth !== undefined) {
+      if (BLOCK_OPENERS.has(kind)) depth++;
+      else if (BLOCK_ENDS.has(kind)) {
         depth--;
-        if (depth === branchDepth) skipping = false;
-        output.push(statement);
-      } else if (branch && depth === branchDepth) {
-        skipping = false;
+        if (depth < skipDepth) {
+          skipDepth = undefined;
+          output.push(statement);
+        }
+      } else if (BLOCK_BRANCHES.has(kind) && depth === skipDepth) {
+        skipDepth = undefined;
         output.push(statement);
       }
       continue;
     }
     output.push(statement);
-    if (opens) depth++;
-    if (closes) depth = Math.max(0, depth - 1);
-    if (isTerminal(statement)) {
+    if (BLOCK_OPENERS.has(kind)) depth++;
+    else if (BLOCK_ENDS.has(kind)) depth = Math.max(0, depth - 1);
+    else if (isTerminal(statement) || isSuspendingStatement(statement)) {
       if (depth === 0) return output;
-      skipping = true;
-      branchDepth = depth;
+      skipDepth = depth;
     }
   }
   return output;
@@ -860,6 +1016,9 @@ function truncateTerminalPaths(statements) {
 function eventBody(ir, event, sourceStatements = ir.events[event] ?? [], qualifierOverride) {
   const statements = truncateTerminalPaths(sourceStatements);
   const context = methodContext(ir, event, qualifierOverride, {statements: sourceStatements});
+  context.screenStates = event === "at_selection_screen_output"
+    ? { kind: "selection", table: "ct_states" }
+    : storedScreenStates(screenStatePlan(ir).defaultKind);
   if (event === "at_selection_screen_value_req") {
     const f4Call = statements.find((statement) => statement.kind === "CallFunction" && /F4IF_INT_TABLE_VALUE_REQUEST/i.test(statement.text));
     if (f4Call) {
@@ -885,19 +1044,13 @@ function eventBody(ir, event, sourceStatements = ir.events[event] ?? [], qualifi
     const match = write && /^WRITE\s+('(?:''|[^'])*')/i.exec(write.text.trim());
     if (match) return { body: [`rv_text = ${match[1]}.`], lowered: [] };
   }
-  const index = suspensionIndex(statements);
-  const terminal = terminalIndex(statements);
-  const end = index >= 0 ? index + 1 : terminal >= 0 ? terminal + 1 : statements.length;
-  const activeStatements = statements.slice(0, end);
-  const lowered = lowerStatements(activeStatements, context);
+  const lowered = lowerStatements(statements, context);
   const transport = selectionStateTransport(ir, event);
-  const fieldSymbols = globalFieldSymbolDeclarations(ir, activeStatements);
-  const continuation = index >= 0 ? continuationFor(ir, statements[index]) : undefined;
+  const fieldSymbols = globalFieldSymbolDeclarations(ir, statements);
   let body = [
     ...fieldSymbols,
     ...transport.hydrate,
     ...removePromotedDeclarations(ir, lowered.map((item) => item.text)),
-    ...continuationClosers(continuation),
     ...transport.flush,
   ];
   const hasWriter = body.some((line) => line.includes("lo_writer->"));
@@ -907,7 +1060,7 @@ function eventBody(ir, event, sourceStatements = ir.events[event] ?? [], qualifi
   }
   if (event === "start_of_selection" && body.length) body.unshift(`io_session->get_list( )->set_title( ${literal(ir.reportTitle ?? ir.targetClassName)} ).`);
   if (hasWriter) body = addWriterDeclaration(body);
-  return { body, lowered, suspension: index >= 0 ? { statement: statements[index], tail: statements.slice(index + 1) } : undefined };
+  return { body, lowered };
 }
 
 function qualifierGuard(ir, event, body, qualifierOverride) {
@@ -960,6 +1113,7 @@ function reportMethods(ir) {
         body.unshift(`io_session->get_list( )->set_title( ${literal(ir.reportTitle ?? ir.targetClassName)} ).`);
       }
       if (event === "at_selection_screen" && ir.continuations?.length) body.push(...nestedSelectionCaptures(ir));
+      if (event === "at_selection_screen_output") body.unshift(...selectionStatesSetter(ir));
       methods.push(method(`zif_gg_report_v1~${event}`, body));
     }
   }
@@ -1003,7 +1157,7 @@ function resumeMethod(ir) {
       ?? ir.modules?.find((item) => item.statements?.includes(statement));
     const ownerIsModule = ir.modules?.includes(owner) === true;
     const ownerStatements = owner?.statements ?? [];
-    const tail = resumeTail(ownerStatements, ownerStatements.indexOf(statement), continuation);
+    const tail = truncateTerminalPaths(resumeTail(ownerStatements, ownerStatements.indexOf(statement)));
     let lowered;
     if (tail.some((item) => item.kind === "CallFunction" && /LIST_FROM_MEMORY/i.test(item.text))) {
       lowered = [
@@ -1014,14 +1168,18 @@ function resumeMethod(ir) {
       ];
     } else {
       const context = methodContext(ir, ownerIsModule ? "dynpro" : "resume");
+      context.screenStates = ownerIsModule ? storedScreenStates("dynpro")
+        : ir.routines?.includes(owner) ? routineScreenStates(ir, owner)
+        : storedScreenStates(screenStatePlan(ir).defaultKind);
       lowered = removePromotedDeclarations(ir, lowerStatements(tail, context).map((item) => item.text));
       lowered = [...globalFieldSymbolDeclarations(ir, tail), ...lowered];
-      if (lowered.some((line) => line.includes("lo_writer->"))) lowered = addWriterDeclaration(lowered);
     }
     if (lowered.length === 0) lowered.push("RETURN.");
     cases.push(`WHEN '${id}'.`, ...lowered);
   }
   const body = ["CASE is_resume-continuation-id.", ...(cases.length ? cases : ["WHEN OTHERS.", "RETURN."]), ...(cases.length ? ["WHEN OTHERS.", "RETURN."] : []), "ENDCASE."];
+  // One writer serves every continuation: each WHEN declaring its own inline
+  // DATA(lo_writer) would declare the same name twice in one method.
   return method("zif_gg_resumable_v1~resume", body.some((line) => line.includes("lo_writer->")) ? addWriterDeclaration(body) : body, "Continuation states are explicit so unsupported suspension semantics remain visible.");
 }
 
@@ -1107,13 +1265,12 @@ function unsupportedDynamicTableAction(ir, routine) {
 function routineBody(ir, routine) {
   const dynamicTableAction = unsupportedDynamicTableAction(ir, routine);
   if (dynamicTableAction) return dynamicTableAction;
-  const statements = truncateTerminalPaths(routine.statements ?? []);
-  const index = suspensionIndex(statements);
-  const active = index >= 0 ? statements.slice(0, index + 1) : statements;
+  const active = truncateTerminalPaths(routine.statements ?? []);
   const context = methodContext(ir, "start_of_selection", undefined, {
     parameters: routine.parameters,
     statements: routine.statements ?? [],
   });
+  context.screenStates = routineScreenStates(ir, routine);
   context.contextMenu = /^ON_CTMENU(?:_|$)/i.test(String(routine.name ?? ""));
   let lowered = removePromotedDeclarations(ir, lowerStatements(active, context).map((item) => item.text));
   lowered = [...globalFieldSymbolDeclarations(ir, active), ...lowered];
@@ -1131,7 +1288,6 @@ function routineBody(ir, routine) {
       "CREATE OBJECT go_ili EXPORTING parent = go_host.",
       "go_ili->hide( ).");
   }
-  if (index >= 0) lowered.push(...continuationClosers(continuationFor(ir, statements[index])));
   if (lowered.some((line) => line.includes("lo_writer->"))) lowered = addWriterDeclaration(lowered);
   return lowered;
 }
@@ -1370,6 +1526,8 @@ function dynproMethods(ir, metadata = ir.dynproMetadata, interfaceName = "zif_gg
     const fields = [`number = '${screenNumber(screen.number)}'`];
     if (screen.title) fields.push(`title = ${literal(screen.title)}`);
     if (screen.nextScreen !== undefined) fields.push(`next_screen = '${screenNumber(screen.nextScreen)}'`);
+    const okCode = screen.okCode ? String(screen.okCode).trim().toUpperCase() : screenOkCode(screen.elements);
+    if (okCode) fields.push(`ok_code = '${okCode}'`);
     if (screen.modal) fields.push("modal = abap_true");
     if (screen.width !== undefined) fields.push(`width = ${screen.width * 10}`);
     if (screen.height !== undefined) fields.push(`height = ${screen.height * 26 + 20}`);
@@ -1586,7 +1744,11 @@ function dynproMethods(ir, metadata = ir.dynproMetadata, interfaceName = "zif_gg
     if (!modules.length) return ["RETURN."];
     const lines = ["CASE is_context-module."];
     for (const module of modules) {
-      const context = { ...methodContext(ir, "dynpro"), ucomm: "is_context-ucomm" };
+      const context = {
+        ...methodContext(ir, "dynpro"),
+        ucomm: "is_context-ucomm",
+        ...(direction === "OUTPUT" ? {} : { screenStates: storedScreenStates("dynpro", { row: "is_context-row" }) }),
+      };
       const body = [
         ...globalFieldSymbolDeclarations(ir, module.statements),
         ...removePromotedDeclarations(ir, lowerStatements(module.statements, context).map((item) => item.text)),
@@ -1668,7 +1830,11 @@ function dynproMethods(ir, metadata = ir.dynproMetadata, interfaceName = "zif_gg
       "CASE is_context-module.",
     );
     for (const module of modules) {
-      const context = { ...methodContext(ir, "dynpro"), ucomm: "is_context-ucomm" };
+      const context = {
+        ...methodContext(ir, "dynpro"),
+        ucomm: "is_context-ucomm",
+        screenStates: storedScreenStates("dynpro", { row: "is_context-row" }),
+      };
       const body = [
         ...globalFieldSymbolDeclarations(ir, module.statements),
         ...removePromotedDeclarations(ir, lowerStatements(module.statements, context).map((item) => item.text)),
@@ -1699,7 +1865,7 @@ function dynproMethods(ir, metadata = ir.dynproMetadata, interfaceName = "zif_gg
     method(interfaceMethod("build_screens"), buildScreens),
     method(interfaceMethod("build_flow_logic"), buildFlow),
     method(interfaceMethod("initialization"), [...stateFlush, ...tableFlush]),
-    method(interfaceMethod("process_output_module"), [...stateHydrate, ...tableHydrate, ...tableContext, ...statusLines, ...cursorLines, ...dispatch("OUTPUT"), ...stateFlush, ...tableFlush]),
+    method(interfaceMethod("process_output_module"), [...dynproStatesSetter(ir), ...stateHydrate, ...tableHydrate, ...tableContext, ...statusLines, ...cursorLines, ...dispatch("OUTPUT"), ...stateFlush, ...tableFlush]),
     method(interfaceMethod("process_input_module"), [...stateHydrate, ...tableHydrate, ...tableContext, ...dispatch("INPUT"), ...stateFlush, ...tableFlush]),
     method(interfaceMethod("process_on_value_request"), valueRequest),
     method(interfaceMethod("process_on_help_request"), helpRequest),
@@ -1746,18 +1912,38 @@ function helperDefinitionHeader(localClass, generatedName, ir) {
   return `CLASS ${generatedName.toLowerCase()} DEFINITION PUBLIC${rest ? ` ${renameIdentifiers(rest, allRenames(ir))}` : ""}.`;
 }
 
+// A static event handler is called by the event, which passes only the event's
+// parameters, so it cannot take io_owner and io_session like other static
+// methods. It reads them from static attributes that SET HANDLER fills instead.
+function isStaticEventHandler(text) {
+  return /^\s*CLASS-METHODS\b[\s\S]*\bFOR\s+EVENT\b/i.test(String(text ?? ""));
+}
+
+function staticEventHandlerNames(localClass) {
+  return new Set((localClass.definition ?? [])
+    .filter((statement) => isStaticEventHandler(statement.text))
+    .map((statement) => /^\s*CLASS-METHODS\s+([A-Z][A-Z0-9_]*)\b/i.exec(statement.text)?.[1]?.toUpperCase())
+    .filter(Boolean));
+}
+
 function helperMethodContext(ir, localClass, localMethod) {
   const isStaticMethod = (localClass.definition ?? []).some((statement) => {
     const name = /^\s*CLASS-METHODS\s+([A-Z][A-Z0-9_]*)\b/i.exec(statement.text ?? "")?.[1];
     return name && name.toUpperCase() === String(localMethod?.name ?? "").toUpperCase();
   });
+  const isEventHandler = staticEventHandlerNames(localClass).has(String(localMethod?.name ?? "").toUpperCase());
   const context = methodContext(ir, "local_class", undefined, {
     statements: localMethod?.statements ?? ir.statements ?? [],
   });
+  const [owner, session] = isEventHandler
+    ? ["go_owner", "go_session"]
+    : isStaticMethod ? ["io_owner", "io_session"] : ["mo_owner", "mo_session"];
   context.ucomm = "sy-ucomm";
-  context.sessionVariable = isStaticMethod ? "io_session" : "mo_session";
-  context.ownerPrefix = isStaticMethod ? "io_owner->" : "mo_owner->";
-  context.localClassOwner = isStaticMethod ? "io_owner" : "mo_owner";
+  context.sessionVariable = session;
+  context.ownerPrefix = `${owner}->`;
+  context.screenStates = storedScreenStates(screenStatePlan(ir).defaultKind, { owner: context.ownerPrefix });
+  context.localClassOwner = owner;
+  context.localClassName = String(localClass.name ?? "").toUpperCase();
   const ownerReplacements = Object.fromEntries(Object.entries(globalMemberNames(ir))
     .map(([name, member]) => [name, `${context.ownerPrefix}${member}`]));
   const localTypeUses = new Set([
@@ -1776,8 +1962,9 @@ function helperMethodContext(ir, localClass, localMethod) {
     ...(ir.selections ?? []).flatMap((screen) => (screen.elements ?? [])
       .filter((item) => item.name)
       .flatMap((item) => {
-        const reference = ir.statePlan?.selectionState?.[item.name]?.member ?? item.name.toLowerCase();
-        const fields = item.ranges
+        // The member lives on the owner class, like the report globals above.
+        const reference = `${context.ownerPrefix}${ir.statePlan?.selectionState?.[item.name]?.member ?? item.name.toLowerCase()}`;
+        const fields = item.kind === "select-option"
           ? [[`${item.name}-low`, `${reference}[ 1 ]-low`], [`${item.name}-high`, `${reference}[ 1 ]-high`]]
           : [];
         return [...fields, [item.name, reference]];
@@ -1795,13 +1982,14 @@ function helperMethodBody(ir, localClass, localMethod) {
   const statements = truncateTerminalPaths(localMethod.statements ?? []);
   const context = helperMethodContext(ir, localClass, localMethod);
   let body = lowerStatements(statements, context).map((item) => item.text);
-  if (!context.isStaticMethod) {
-    body = body.map((line) => line.replace(/\bio_session\b/gi, (name, offset, source) =>
-      /^\s*=/.test(source.slice(offset + name.length)) ? name : "mo_session"));
-  }
   body = [...globalFieldSymbolDeclarations(ir, statements), ...body];
-  if (body.some((line) => line.includes("lo_writer->")) && !/\bio_session\b/i.test(localMethod.definition?.text ?? "")) {
-    body = ["* TODO GGCONV-E501: local class writer access requires an explicit session mapping."];
+  if (body.some((line) => line.includes("lo_writer->"))) body = addWriterDeclaration(body);
+  // Lowering writes io_session, the writer declaration included; methods
+  // without that parameter use the session the helper stores for its owner.
+  // `io_session =` is a named argument and stays.
+  if (context.sessionVariable !== "io_session") {
+    body = body.map((line) => line.replace(/\bio_session\b/gi, (name, offset, source) =>
+      /^\s*=/.test(source.slice(offset + name.length)) ? name : context.sessionVariable));
   }
   return body.length ? body : ["RETURN."];
 }
@@ -1811,8 +1999,7 @@ function helperDefinitionBody(statements, rename) {
   let structured;
   const flushStructured = () => {
     if (!structured) return;
-    const components = structured.components.map((component) => `${component}, `).join("");
-    lines.push(`  ${structured.keyword}: BEGIN OF ${structured.beginName}${components ? `, ${components}` : " "}END OF ${structured.endName ?? structured.beginName}.`);
+    lines.push(`  ${structuredDeclaration(structured.keyword, structured.beginName, structured.components, structured.endName ?? structured.beginName)}`);
     structured = undefined;
   };
   for (const statement of statements) {
@@ -1857,35 +2044,54 @@ function helperDefinitionBody(statements, rename) {
   return lines;
 }
 
+// Adds parameters to a METHODS or CLASS-METHODS definition. IMPORTING comes
+// before EXPORTING, CHANGING, RETURNING, RAISING and EXCEPTIONS, so the
+// parameters close an existing IMPORTING or open one ahead of those. A chained
+// definition ends in a comma, which becomes a period like other chain elements.
+function withImportingParameters(definition, parameters) {
+  const text = definition.replace(/\s*[.,]\s*$/, "");
+  const masked = text.replace(/'(?:''|[^'])*'|`(?:``|[^`])*`|"[^\n]*/g, (part) => " ".repeat(part.length));
+  const importing = /\bIMPORTING\b/i.exec(masked);
+  const from = importing ? importing.index + importing[0].length : 0;
+  const next = /\b(?:EXPORTING|CHANGING|RETURNING|RAISING|EXCEPTIONS)\b/i.exec(masked.slice(from));
+  // Insert after the last code ahead of that keyword, not into a " comment.
+  const at = masked.slice(0, next ? from + next.index : masked.length).trimEnd().length;
+  return `${text.slice(0, at)} ${importing ? "" : "IMPORTING "}${parameters}${text.slice(at)}.`;
+}
+
 function helperSource(ir, options, localClass) {
   const generatedName = localClass.generatedName;
   const rename = (text) => renameIdentifiers(text, allRenames(ir));
+  const ownerSessionParameters = `io_owner TYPE REF TO ${ir.targetClassName.toLowerCase()} io_session TYPE REF TO zif_gg_session_v1`;
   const originalConstructor = (localClass.methods ?? []).find((localMethod) => localMethod.name?.toUpperCase() === "CONSTRUCTOR");
-  const originalConstructorDefinition = originalConstructor?.definition?.text
-    ? rename(originalConstructor.definition.text).replace(/\.\s*$/, "")
-    : undefined;
-  const constructorSignature = originalConstructorDefinition
-    ? `${originalConstructorDefinition}${/\bIMPORTING\b/i.test(originalConstructorDefinition) ? " " : " IMPORTING "}io_owner TYPE REF TO ${ir.targetClassName.toLowerCase()} io_session TYPE REF TO zif_gg_session_v1.`
-    : `METHODS constructor IMPORTING io_owner TYPE REF TO ${ir.targetClassName.toLowerCase()} io_session TYPE REF TO zif_gg_session_v1.`;
+  const constructorSignature = originalConstructor?.definition?.text
+    ? withImportingParameters(rename(originalConstructor.definition.text), ownerSessionParameters)
+    : `METHODS constructor IMPORTING ${ownerSessionParameters}.`;
+  const eventHandlers = staticEventHandlerNames(localClass);
   const bridge = [
     `    ${constructorSignature}`,
     `    DATA mo_owner TYPE REF TO ${ir.targetClassName.toLowerCase()}.`,
     "    DATA mo_session TYPE REF TO zif_gg_session_v1.",
+    ...(eventHandlers.size ? [
+      `    CLASS-DATA go_owner TYPE REF TO ${ir.targetClassName.toLowerCase()}.`,
+      "    CLASS-DATA go_session TYPE REF TO zif_gg_session_v1.",
+    ] : []),
   ];
-  const originalDefinition = helperDefinitionBody(
-    (localClass.definition ?? []).filter((statement) => !(statement.kind === "MethodDef" && /^\s*METHODS\s+constructor\b/i.test(statement.text))),
-    rename,
+  // Static methods, other than event handlers, get the owner and session as
+  // parameters. They are added before the statement is split into lines, so a
+  // definition spanning several lines keeps its parameters in order.
+  const definitionWithStaticBridges = helperDefinitionBody(
+    (localClass.definition ?? [])
+      .filter((statement) => !(statement.kind === "MethodDef" && /^\s*METHODS\s+constructor\b/i.test(statement.text)))
+      .map((statement) => {
+        const text = rename(statement.text);
+        const bridged = /^\s*CLASS-METHODS\s+[A-Z][A-Z0-9_]*\b/i.test(text)
+          && !isStaticEventHandler(text)
+          && !/\bIO_OWNER\b/i.test(text);
+        return { ...statement, text: bridged ? withImportingParameters(text, ownerSessionParameters) : text };
+      }),
+    (text) => text,
   );
-  const staticMethods = new Set((localClass.definition ?? [])
-    .filter((statement) => /^\s*CLASS-METHODS\b/i.test(statement.text ?? ""))
-    .map((statement) => /^\s*CLASS-METHODS\s+([A-Z][A-Z0-9_]*)\b/i.exec(statement.text)?.[1]?.toUpperCase())
-    .filter(Boolean));
-  const ownerSessionParameters = `io_owner TYPE REF TO ${ir.targetClassName.toLowerCase()} io_session TYPE REF TO zif_gg_session_v1`;
-  const definitionWithStaticBridges = originalDefinition.map((line) => {
-    const methodName = /^\s*CLASS-METHODS\s+([A-Z][A-Z0-9_]*)\b/i.exec(line)?.[1]?.toUpperCase();
-    if (!methodName || !staticMethods.has(methodName) || /\bIO_OWNER\b/i.test(line)) return line;
-    return `${line.replace(/\.\s*$/, "")}${/\bIMPORTING\b/i.test(line) ? " " : " IMPORTING "}${ownerSessionParameters}.`;
-  });
   const publicSection = definitionWithStaticBridges.findIndex((line) => /^\s*PUBLIC SECTION\.$/i.test(line));
   const definitionBody = publicSection >= 0
     ? [...definitionWithStaticBridges.slice(0, publicSection + 1), ...bridge, ...definitionWithStaticBridges.slice(publicSection + 1)]
@@ -1934,8 +2140,9 @@ export function emitClassSource(ir, options) {
   definition.push("ENDCLASS.", "", `CLASS ${className} IMPLEMENTATION.`, "");
   const implementation = [];
   if (ir.interfaces.includes("zif_gg_transaction_v1")) {
-    implementation.push(method("zif_gg_transaction_v1~get_transaction", [`rs_transaction = VALUE #( tcode = '${ir.transactionCode}' description = '${String(ir.description).replaceAll("'", "''")}' ).`]));
+    implementation.push(method("zif_gg_transaction_v1~get_transaction", [`rs_transaction = VALUE #( tcode = '${ir.transactionCode}' description = '${String(ir.description).replaceAll("'", "''")}'${programField(ir)} ).`]));
   }
+  if (ir.interfaces.includes("zif_gg_program_v1")) implementation.push(programMethod(ir));
   if (ir.programKind === "module-pool") implementation.push(...dynproMethods(ir));
   else {
     implementation.push(...reportMethods(ir));
@@ -1981,15 +2188,17 @@ export function emitPartialSkeleton(ir, options, diagnostics) {
     "",
     "  PUBLIC SECTION.",
     "    INTERFACES zif_gg_report_v1.",
-    "    INTERFACES zif_gg_transaction_v1.",
+    ...(ir.transactionCode ? ["    INTERFACES zif_gg_transaction_v1."] : []),
+    ...(hasProgramMetadata(ir) ? ["    INTERFACES zif_gg_program_v1."] : []),
     "",
     "ENDCLASS.",
     "",
     `CLASS ${className} IMPLEMENTATION.`,
     "",
-    method("zif_gg_transaction_v1~get_transaction", [
-      `rs_transaction = VALUE #( tcode = ${literal(ir.transactionCode)} description = ${literal(ir.description)} ).`,
-    ]).toString(),
+    ...(ir.transactionCode ? [method("zif_gg_transaction_v1~get_transaction", [
+      `rs_transaction = VALUE #( tcode = ${literal(ir.transactionCode)} description = ${literal(ir.description)}${programField(ir)} ).`,
+    ]).toString()] : []),
+    ...(hasProgramMetadata(ir) ? [programMethod(ir).toString()] : []),
     ...methods.map((entry) => entry.toString()),
     "ENDCLASS.",
     "",
@@ -1999,9 +2208,11 @@ export function emitPartialSkeleton(ir, options, diagnostics) {
 export function emitPartialApplication(ir, options, diagnostics) {
   const className = ir.targetClassName.toLowerCase();
   const hasScreenProvider = ir.programKind === "report" && (ir.screenMetadata?.screens?.length ?? 0) > 0;
-  const interfaceNames = ir.programKind === "module-pool"
+  const interfaceNames = (ir.programKind === "module-pool"
     ? ["zif_gg_dynpro_v1", "zif_gg_transaction_v1"]
-    : ["zif_gg_report_v1", "zif_gg_transaction_v1", ...(hasScreenProvider ? ["zif_gg_screen_provider_v1"] : [])];
+    : ["zif_gg_report_v1", "zif_gg_transaction_v1", ...(hasScreenProvider ? ["zif_gg_screen_provider_v1"] : [])])
+    .filter((name) => name !== "zif_gg_transaction_v1" || ir.transactionCode)
+    .concat(hasProgramMetadata(ir) ? ["zif_gg_program_v1"] : []);
   const definition = [
     `CLASS ${className} DEFINITION PUBLIC FINAL CREATE PUBLIC.`,
     "",
@@ -2053,11 +2264,12 @@ export function emitPartialApplication(ir, options, diagnostics) {
     .map((item) => `* TODO ${item.code}: ${item.construct}`)
     .filter((value, index, values) => values.indexOf(value) === index);
   const transaction = method("zif_gg_transaction_v1~get_transaction", [
-    `rs_transaction = VALUE #( tcode = ${literal(ir.transactionCode)} description = ${literal(label)} ).`,
+    `rs_transaction = VALUE #( tcode = ${literal(ir.transactionCode)} description = ${literal(label)}${programField(ir)} ).`,
   ]);
   return `${header({className: ir.targetClassName, ir, options})}${todos.join("\n")}${todos.length ? "\n" : ""}${[
     ...definition,
-    transaction.toString(),
+    ...(ir.transactionCode ? [transaction.toString()] : []),
+    ...(hasProgramMetadata(ir) ? [programMethod(ir, label).toString()] : []),
     ...methods.map((entry) => entry.toString()),
     "ENDCLASS.",
     "",
@@ -2067,8 +2279,9 @@ export function emitPartialApplication(ir, options, diagnostics) {
 export function lowerToScaffoldIR(ir, options, sourceMap = []) {
   const methods = [];
   if (ir.interfaces.includes("zif_gg_transaction_v1")) {
-    methods.push(method("zif_gg_transaction_v1~get_transaction", [`rs_transaction = VALUE #( tcode = '${ir.transactionCode}' description = '${String(ir.description).replaceAll("'", "''")}' ).`]));
+    methods.push(method("zif_gg_transaction_v1~get_transaction", [`rs_transaction = VALUE #( tcode = '${ir.transactionCode}' description = '${String(ir.description).replaceAll("'", "''")}'${programField(ir)} ).`]));
   }
+  if (ir.interfaces.includes("zif_gg_program_v1")) methods.push(programMethod(ir));
   if (ir.programKind === "module-pool") methods.push(...dynproMethods(ir));
   else {
     methods.push(...reportMethods(ir));
