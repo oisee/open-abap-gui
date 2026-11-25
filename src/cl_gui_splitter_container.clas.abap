@@ -207,6 +207,7 @@ CLASS cl_gui_splitter_container IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD constructor.
+    super->constructor( ).
     DATA lv_row TYPE i.
     DATA lv_column TYPE i.
     DATA ls_cell TYPE ty_cell.

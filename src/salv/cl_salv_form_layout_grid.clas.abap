@@ -67,6 +67,7 @@ ENDCLASS.
 CLASS cl_salv_form_layout_grid IMPLEMENTATION.
 
   METHOD constructor.
+    super->constructor( ).
     RETURN. " todo, implement method
   ENDMETHOD.
 

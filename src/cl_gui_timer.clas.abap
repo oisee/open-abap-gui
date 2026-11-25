@@ -32,6 +32,7 @@ ENDCLASS.
 CLASS cl_gui_timer IMPLEMENTATION.
 
   METHOD constructor.
+    super->constructor( ).
     interval = 1000.
     mv_running = abap_false.
     CLEAR mv_tick_count.

@@ -49,6 +49,7 @@ ENDCLASS.
 CLASS cl_gui_simple_tree IMPLEMENTATION.
 
   METHOD constructor.
+    super->constructor( ).
     cl_gui_control=>initialize(
       control = me
       parent  = parent

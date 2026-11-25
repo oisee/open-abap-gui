@@ -175,6 +175,7 @@ CLASS cl_gui_column_tree IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD constructor.
+    super->constructor( ).
     cl_gui_control=>initialize(
       control = me
       parent  = parent

@@ -99,6 +99,7 @@ CLASS cl_gui_picture IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD constructor.
+    super->constructor( ).
     cl_gui_control=>initialize(
       control = me
       parent  = parent

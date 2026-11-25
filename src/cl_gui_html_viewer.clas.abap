@@ -300,6 +300,7 @@ CLASS cl_gui_html_viewer IMPLEMENTATION.
   ENDMETHOD.
 
   METHOD constructor.
+    super->constructor( ).
     DATA ls_viewer TYPE ty_viewer.
 
     cl_gui_control=>initialize(
