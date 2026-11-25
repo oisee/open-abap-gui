@@ -757,12 +757,13 @@ CLASS zcl_gg_host_list IMPLEMENTATION.
       mt_render_lines[ is_line-index ]-text = is_line-text.
       mt_render_lines[ is_line-index ]-changed = abap_true.
       IF mt_render_lines[ is_line-index ]-fragments IS INITIAL.
+        ASSIGN mt_render_lines[ is_line-index ] TO FIELD-SYMBOL(<ls_render_line>).
         APPEND VALUE #( kind     = 'TEXT'
                         text     = is_line-text
                         position = 1
                         length   = strlen( is_line-text )
                         format   = is_line-format )
-          TO mt_render_lines[ is_line-index ]-fragments.
+          TO <ls_render_line>-fragments.
       ELSE.
         LOOP AT mt_render_lines[ is_line-index ]-fragments ASSIGNING FIELD-SYMBOL(<ls_fragment>).
           <ls_fragment>-format = is_line-format.

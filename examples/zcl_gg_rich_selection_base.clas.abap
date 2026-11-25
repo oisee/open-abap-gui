@@ -269,7 +269,8 @@ CLASS zcl_gg_rich_selection_base IMPLEMENTATION.
       WHEN '73'.
         CASE iv_ucomm.
           WHEN 'RANGE_ADD'.
-            APPEND VALUE #( sign = 'I' option = 'EQ' ) TO ct_values[ name = 'S_MULTI' ]-ranges.
+            ASSIGN ct_values[ name = 'S_MULTI' ] TO FIELD-SYMBOL(<ls_multi>).
+            APPEND VALUE #( sign = 'I' option = 'EQ' ) TO <ls_multi>-ranges.
             stop_with_message( iv_text    = 'Range row added'
                                io_session = io_session ).
           WHEN 'RANGE_REMOVE'.
